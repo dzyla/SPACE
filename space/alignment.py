@@ -57,6 +57,13 @@ def align_sequence(args: tuple) -> tuple:
         alignment = next(alignment)  # Get the first alignment
         if alignment:
             score = float(alignment.score)
+            
+            #calculate sequence identity
+            seq1 = alignment[0]
+            seq2 = alignment[1]
+            matches = sum(aa1 == aa2 for aa1, aa2 in zip(seq1, seq2))
+            score = matches / len(seq1)*100
+            
             return score, seq_str, seq_id
         else:
             return None, seq_str, seq_id

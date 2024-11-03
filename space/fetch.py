@@ -123,15 +123,30 @@ def search_and_save_protein_uniprot(
         st.error(f"An unexpected error occurred while fetching UniProt data: {e}")
         raise e
 
-def get_protein_sequences(file_path: str) -> list:
+def get_protein_sequences(file_path: str, remove_PDB: bool = False) -> list:
     try:
+        # Parse the protein sequences from the FASTA file
         proteins = list(SeqIO.parse(file_path, "fasta"))
+        
+        # Count initial number of sequences
+        initial_count = len(proteins)
+
+        # Filter out sequences starting with "pdb" if remove_PDB is True
+        if remove_PDB:
+            proteins = [protein for protein in proteins if not protein.id.lower().startswith("pdb")]
+            removed_count = initial_count - len(proteins)  # Calculate the number of removed sequences
+            st.info(f"Removed {removed_count} sequences from PDB.")
+        
+        # Display a warning if no sequences are found after filtering
         if not proteins:
             st.warning("No protein sequences found in the provided FASTA file.")
+        
         return proteins
+
     except FileNotFoundError:
         st.error(f"The file {file_path} was not found.")
         raise FileNotFoundError(f"The file {file_path} does not exist.")
+
     except Exception as e:
         st.error(f"An error occurred while reading the FASTA file: {e}")
         raise e

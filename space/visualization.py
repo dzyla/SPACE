@@ -470,10 +470,10 @@ def visualize_mutations_scatter(reference_seq: str, unique_mutations: dict, st_c
     fig.write_html("mutations_scatter.html")
 
     # Save the mutations scatter plot as PNG
-    try:
-        fig.write_image("mutations_scatter.png")
-    except Exception as e:
-        st.error(f"Failed to save mutations scatter plot as PNG: {e}")
+    # try:
+    #     fig.write_image("mutations_scatter.png")
+    # except Exception as e:
+    #     st.error(f"Failed to save mutations scatter plot as PNG: {e}")
 
     # Optimize performance by using Scattergl and limiting data if necessary
     if st_column:
