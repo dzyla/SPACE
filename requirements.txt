@@ -17,3 +17,4 @@ seaborn==0.13.2
 streamlit==1.39.0
 stmol==0.0.9
 py3dmol==2.4.0
+ipython-genutils==0.2.0
