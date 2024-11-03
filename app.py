@@ -78,7 +78,8 @@ def main():
     st.title("Sequence Protein Alignment and Conservation Engine (SPACE) :stars:")
     welcome = st.empty()
     if "result" not in st.session_state:
-        welcome.markdown("""
+        welcome.markdown(
+            """
     Welcome to **Sequence Protein Alignment and Conservation Engine (SPACE)**, a tool for exploring and understanding protein sequences and their sequence conservation in 2D and 3D. 
 
     ## Description
@@ -118,7 +119,8 @@ def main():
     - [Streamlit](https://streamlit.io/)
 
 
-    """)
+    """
+        )
     else:
         welcome.empty()
 
@@ -152,7 +154,6 @@ def main():
             help="Required for accessing NCBI databases.",
             autocomplete="email",
             placeholder="Your@email.com",
-            
         )
         data_source = st.selectbox("Select data source:", ["NCBI", "UniProt"])
         query = st.text_input("Enter your query:", "Hendra henipavirus F")
@@ -166,20 +167,29 @@ def main():
             step=1,
         )
 
-        clustalo_default = (
-            "./exceculatbles/win64/clustalo.exe"
-            if os.path.exists(r"./exceculatbles/win64/clustalo.exe")
-            else "clustalo"
-        )
+        # defining the default path for al2co executable
+        # detect whether it is windows or linux
+        system = platform.system()
+
+        if system == "Windows":
+            clustalo_default = (
+                "./exceculatbles/win64/clustalo.exe"
+                if os.path.exists(r"./exceculatbles/win64/clustalo.exe")
+                else "clustalo"
+            )
+        else:
+            os.chmod("./exceculatbles/amd64/clustalo", 0o777)
+            clustalo_default = (
+                "./exceculatbles/win64/clustalo.exe"
+                if os.path.exists(r"./exceculatbles/amd64/clustalo")
+                else "clustalo"
+            )
+
         clustalo_path = st.text_input(
             "Enter the path to Clustal Omega executable:",
             value=clustalo_default,
             help="Provide the path if Clustal Omega is not in your system PATH.",
         )
-
-        # defining the default path for al2co executable
-        # detect whether it is windows or linux
-        system = platform.system()
 
         if system == "Windows":
             al2co_default = (
@@ -189,6 +199,7 @@ def main():
             )
 
         else:
+            os.chmod("./exceculatbles/amd64/al2co", 0o777)
             al2co_default = (
                 r"./exceculatbles/amd64/al2co"
                 if os.path.exists(r"./exceculatbles/amd64/al2co.exe")
@@ -227,7 +238,9 @@ def main():
                                 query, filename, max_seqs=max_seqs
                             )
                     if file_path:
-                        proteins_list = get_protein_sequences(file_path, remove_PDB=remove_PDB)
+                        proteins_list = get_protein_sequences(
+                            file_path, remove_PDB=remove_PDB
+                        )
                         st.session_state.proteins_list = proteins_list
                         st.session_state.reference_seq_input = None
                         st.session_state.result = None
@@ -728,8 +741,8 @@ def main():
                     None  # Prevent further processing until PDB is uploaded
                 )
 
-        frequency_threshold = 0.1 # Needs further testing
-        #st.slider(
+        frequency_threshold = 0.1  # Needs further testing
+        # st.slider(
         #    "Frequency Threshold for Residue Annotation", 0.0, 1.0, 0.1, 0.001
         # )
 
@@ -950,13 +963,15 @@ def main():
         st.session_state.phylogenetic_tree = None  # Reset phylogenetic_tree
         st.success("Alignment reset. You can perform a new alignment.")
         st.rerun()
-    
-    st.sidebar.markdown('''
+
+    st.sidebar.markdown(
+        """
 Developed by [Dawid Zyla](mailto:dzyla@lji.org)
                      
 Source code: [Github](https://github.com/dzyla/SPACE)
                     
-''')
+"""
+    )
 
 
 if __name__ == "__main__":
