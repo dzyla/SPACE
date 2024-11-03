@@ -37,6 +37,8 @@ st.set_page_config(
     page_title="SPACE",
     layout="wide",
     page_icon=":stars:",
+    initial_sidebar_state="expanded",
+    
 )
 
 
