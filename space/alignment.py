@@ -238,68 +238,68 @@ def perform_msa(
         return None
 
 
-def perform_msa_clustalo(
-    high_score_seqs: list,
-    id_array_selected: list,
-    reference_seq: str,
-    msa_infile: str,
-    msa_outfile: str,
-    clustalo_path: str,
-    max_threads: int,
-) -> Optional[str]:
-    try:
-        final_seqs = high_score_seqs.copy()
-        final_ids = id_array_selected.copy()
-        final_seqs.append(reference_seq)
-        final_ids.append("reference_sequence")
+# def perform_msa_clustalo(
+#     high_score_seqs: list,
+#     id_array_selected: list,
+#     reference_seq: str,
+#     msa_infile: str,
+#     msa_outfile: str,
+#     clustalo_path: str,
+#     max_threads: int,
+# ) -> Optional[str]:
+#     try:
+#         final_seqs = high_score_seqs.copy()
+#         final_ids = id_array_selected.copy()
+#         final_seqs.append(reference_seq)
+#         final_ids.append("reference_sequence")
 
-        records = [
-            SeqRecord(Seq(clean_fasta(seq)), id=fix_id(name), description="")
-            for seq, name in zip(final_seqs, final_ids)
-        ]
+#         records = [
+#             SeqRecord(Seq(clean_fasta(seq)), id=fix_id(name), description="")
+#             for seq, name in zip(final_seqs, final_ids)
+#         ]
 
-        SeqIO.write(records, msa_infile, "fasta")
+#         SeqIO.write(records, msa_infile, "fasta")
 
-        cmd = [
-            clustalo_path,
-            "-i",
-            msa_infile,
-            "-o",
-            msa_outfile,
-            "--force",
-            "--auto",
-            "--threads",
-            str(max_threads),
-            "--outfmt",
-            "fasta",
-            "--verbose",
-        ]
+#         cmd = [
+#             clustalo_path,
+#             "-i",
+#             msa_infile,
+#             "-o",
+#             msa_outfile,
+#             "--force",
+#             "--auto",
+#             "--threads",
+#             str(max_threads),
+#             "--outfmt",
+#             "fasta",
+#             "--verbose",
+#         ]
 
-        with st.spinner(f"Running Clustal Omega: {' '.join(cmd)}"):
-            process = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+#         with st.spinner(f"Running Clustal Omega: {' '.join(cmd)}"):
+#             process = subprocess.run(
+#                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+#             )
 
-        if process.stderr:
-            print(f"Clustal Omega stderr: {process.stderr}")
+#         if process.stderr:
+#             print(f"Clustal Omega stderr: {process.stderr}")
 
-        if process.returncode == 0:
-            with st.expander("View Clustal Omega Output"):
-                st.code(process.stdout)
-            return msa_outfile
-        else:
-            st.error(f"Clustal Omega failed with return code {process.returncode}.")
-            st.error(f"Error message: {process.stderr}")
-            return None
+#         if process.returncode == 0:
+#             with st.expander("View Clustal Omega Output"):
+#                 st.code(process.stdout)
+#             return msa_outfile
+#         else:
+#             st.error(f"Clustal Omega failed with return code {process.returncode}.")
+#             st.error(f"Error message: {process.stderr}")
+#             return None
 
-    except FileNotFoundError:
-        st.error(f"Clustal Omega executable not found at: {clustalo_path}")
-        return None
-    except Exception as e:
-        st.error(f"An unexpected error occurred during MSA: {e}")
-        st.warning("Proceeding despite the error.")
-        print(traceback.format_exc())
-        return None
+#     except FileNotFoundError:
+#         st.error(f"Clustal Omega executable not found at: {clustalo_path}")
+#         return None
+#     except Exception as e:
+#         st.error(f"An unexpected error occurred during MSA: {e}")
+#         st.warning("Proceeding despite the error.")
+#         print(traceback.format_exc())
+#         return None
 
 
 def perform_msa_and_fix_header(
