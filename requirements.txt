@@ -19,3 +19,4 @@ stmol==0.0.9
 py3dmol==2.4.0
 ipython-genutils==0.2.0
 joblib==1.4.2
+pyfamsa==0.5.3
