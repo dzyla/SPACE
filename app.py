@@ -148,6 +148,7 @@ def main():
         st.session_state.proteins_list = None
         st.session_state.phylogenetic_tree = None  # Initialize phylogenetic_tree
         st.session_state.user_pdb = None  # Initialize user-uploaded PDB
+        st.session_state.show_msa = False
 
     # Sidebar inputs
     st.sidebar.header("Parameters")
@@ -160,6 +161,7 @@ def main():
             placeholder="Your@email.com",
         )
         data_source = st.selectbox("Select data source:", ["NCBI", "UniProt"])
+        st.info('Check the query hits [here](https://www.ncbi.nlm.nih.gov/protein/)')
         query = st.text_input("Enter your query:", "Hendra henipavirus F")
         sc1, sc2 = st.columns(2)
         use_refseq = sc1.checkbox("Use RefSeq database", value=False)
@@ -573,7 +575,10 @@ def main():
 
     if st.session_state.get("msa_done"):
         try:
-            plot_msa_image(st.session_state.msa_image, st.session_state.msa_letters)
+            show_msa = st.checkbox("Show MSA", value=st.session_state.show_msa)
+            st.session_state.show_msa = show_msa
+            if show_msa:
+                plot_msa_image(st.session_state.msa_image, st.session_state.msa_letters)
         except Exception as e:
             st.error(f"An error occurred while plotting MSA image: {e}")
             print(traceback.format_exc())
