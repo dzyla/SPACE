@@ -15,6 +15,11 @@ import streamlit as st
 from typing import List, Optional
 import py3Dmol
 from stmol import showmol
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def visualize_al2co_seaborn(al2co_df: pd.DataFrame):
     """
@@ -75,71 +80,76 @@ def visualize_al2co_plotly(al2co_df: pd.DataFrame):
         st.error("No al2co conservation data to visualize.")
         return
 
-    # Drop rows where Location is NaN (gaps in reference)
-    al2co_plot = al2co_df.dropna(subset=["Location"])
+    try:
+        # Drop rows where Location is NaN (gaps in reference)
+        al2co_plot = al2co_df.dropna(subset=["Location"])
 
-    if al2co_plot.empty:
-        st.error("No valid al2co conservation data after removing gaps.")
-        return
+        if al2co_plot.empty:
+            st.error("No valid al2co conservation data after removing gaps.")
+            return
 
-    # Smooth the scores
-    ysmoothed = gaussian_filter1d(al2co_plot["al2co_score"], sigma=2)
+        # Smooth the scores
+        ysmoothed = gaussian_filter1d(al2co_plot["al2co_score"], sigma=2)
 
-    # Define custom colorscale
-    custom_colorscale = [
-        [0.0, "#ff2600"],  # Red
-        [0.5, "#ffc04d"],  # Orange
-        [1.0, "#deddda"],  # Light Blue
-    ]
+        # Define custom colorscale
+        custom_colorscale = [
+            [0.0, "#ff2600"],  # Red
+            [0.5, "#ffc04d"],  # Orange
+            [1.0, "#deddda"],  # Light Blue
+        ]
 
-    # Create Plotly figure
-    fig = go.Figure()
+        # Create Plotly figure
+        fig = go.Figure()
 
-    # Add smoothed trend line
-    fig.add_trace(
-        go.Scatter(
-            x=al2co_plot["Location"],
-            y=ysmoothed,
-            mode="lines",
-            name="Trend",
-            line=dict(color="black"),
+        # Add smoothed trend line
+        fig.add_trace(
+            go.Scatter(
+                x=al2co_plot["Location"],
+                y=ysmoothed,
+                mode="lines",
+                name="Trend",
+                line=dict(color="black"),
+            )
         )
-    )
 
-    # Add scatter plot for conservation scores
-    fig.add_trace(
-        go.Scatter(
-            x=al2co_plot["Location"],
-            y=al2co_plot["al2co_score"],
-            mode="markers",
-            name="Conservation Score",
-            marker=dict(
-                color=al2co_plot["al2co_score"],
-                colorscale=custom_colorscale,
-                size=8,
-                colorbar=dict(title="Conservation Score"),
-                showscale=True,
-            ),
-            hovertemplate=(
-                "Residue: %{text}<br>"
-                "Position: %{x}<br>"
-                "Score: %{y:.3f}"
-            ),
-            text=al2co_plot["Residue"],
+        # Add scatter plot for conservation scores
+        fig.add_trace(
+            go.Scatter(
+                x=al2co_plot["Location"],
+                y=al2co_plot["al2co_score"],
+                mode="markers",
+                name="Conservation Score",
+                marker=dict(
+                    color=al2co_plot["al2co_score"],
+                    colorscale=custom_colorscale,
+                    size=8,
+                    colorbar=dict(title="Conservation Score"),
+                    showscale=True,
+                ),
+                hovertemplate=(
+                    "Residue: %{text}<br>"
+                    "Position: %{x}<br>"
+                    "Score: %{y:.3f}"
+                ),
+                text=al2co_plot["Residue"],
+            )
         )
-    )
 
-    # Update layout
-    fig.update_layout(
-        title="Conservation Scores from al2co",
-        xaxis_title="Residue Position",
-        yaxis_title="Conservation Score",
-        hovermode="closest",
-        height=600,
-    )
-    fig.write_html("al2co_plot.html")
+        # Update layout
+        fig.update_layout(
+            title="Conservation Scores from al2co",
+            xaxis_title="Residue Position",
+            yaxis_title="Conservation Score",
+            hovermode="closest",
+            height=600,
+        )
+        fig.write_html("al2co_plot.html")
 
-    st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
+        logger.info("al2co conservation scores visualized successfully using Plotly.")
+    except Exception as e:
+        st.error(f"An error occurred while visualizing al2co conservation scores: {e}")
+        logger.error("Exception occurred while visualizing al2co conservation scores", exc_info=True)
 
 def visualize_hexbin_plot(
     result: list, score_limit: float, score_max: float, seq_min: int, seq_max: int

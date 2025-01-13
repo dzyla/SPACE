@@ -7,6 +7,7 @@ import platform
 import traceback
 import zipfile
 import io
+import logging
 
 import streamlit as st
 from typing import List, Optional
@@ -41,6 +42,9 @@ st.set_page_config(
     
 )
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Function to create a zip file of given files
 def create_zip_file(file_paths: List[str], zip_name: str) -> Optional[io.BytesIO]:
@@ -275,6 +279,7 @@ def main():
                         st.success("Sequences fetched and saved successfully.")
             except Exception as e:
                 st.error(f"An error occurred: {e}")
+                logger.error("Exception occurred", exc_info=True)
                 print(traceback.format_exc())
 
     # Step 2: Select Reference Sequence if not provided
@@ -346,6 +351,7 @@ def main():
                     st.session_state.phylogenetic_tree = None  # Reset phylogenetic_tree
                 except Exception as e:
                     st.error(f"An error occurred during alignment: {e}")
+                    logger.error("Exception occurred", exc_info=True)
                     print(traceback.format_exc())
 
     # **New Functionality: Upload Own MSA**
@@ -413,6 +419,7 @@ def main():
 
     #         except Exception as e:
     #             st.error(f"An error occurred while processing the uploaded MSA: {e}")
+    #             logger.error("Exception occurred", exc_info=True)
     #             print(traceback.format_exc())
 
     # Step 3: Filter Sequences and Perform MSA
@@ -569,6 +576,7 @@ def main():
                                 )
                 except Exception as e:
                     st.error(f"An error occurred during filtering and MSA: {e}")
+                    logger.error("Exception occurred", exc_info=True)
                     print(traceback.format_exc())
 
     # Step 4: Display MSA Results, Conservation Analysis, al2co Output, and Mutations
@@ -581,6 +589,7 @@ def main():
                 plot_msa_image(st.session_state.msa_image, st.session_state.msa_letters)
         except Exception as e:
             st.error(f"An error occurred while plotting MSA image: {e}")
+            logger.error("Exception occurred", exc_info=True)
             print(traceback.format_exc())
 
         # Display al2co.exe Output
@@ -905,6 +914,7 @@ def main():
         except Exception as e:
             print(traceback.format_exc())
             st.error(f"An error occurred during PDB processing: {e}")
+            logger.error("Exception occurred", exc_info=True)
 
     # File download section
     if st.session_state.get("msa_done"):

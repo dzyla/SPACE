@@ -9,6 +9,11 @@ import traceback
 import pandas as pd
 from shutil import which
 import streamlit as st
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def get_executable_path(executable_name: str, default_path: str) -> str:
     from shutil import which
@@ -83,18 +88,18 @@ def download_alphafold_pdb(accession: str, save_dir: str = '.') -> str:
     try:
         response = requests.get(api_url, headers={'accept': 'application/json'}, timeout=10)
         if response.status_code != 200:
-            print(f"Failed to fetch data for accession '{accession}'. HTTP Status Code: {response.status_code}")
+            logger.error(f"Failed to fetch data for accession '{accession}'. HTTP Status Code: {response.status_code}")
             return None
 
         data = response.json()
         if not isinstance(data, list) or len(data) == 0:
-            print(f"No AlphaFold models found for accession '{accession}'.")
+            logger.error(f"No AlphaFold models found for accession '{accession}'.")
             return None
 
         latest_entry = max(data, key=lambda x: x.get('latestVersion', 0))
         pdb_url = latest_entry.get('pdbUrl')
         if not pdb_url:
-            print(f"PDB URL not available for accession '{accession}'.")
+            logger.error(f"PDB URL not available for accession '{accession}'.")
             return None
 
         pdb_filename = f"selected.pdb"
@@ -106,19 +111,20 @@ def download_alphafold_pdb(accession: str, save_dir: str = '.') -> str:
                 for chunk in pdb_response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
+            logger.info(f"PDB file downloaded successfully for accession '{accession}'.")
             return pdb_filepath
         else:
-            print(f"Failed to download PDB file. HTTP Status Code: {pdb_response.status_code}")
+            logger.error(f"Failed to download PDB file. HTTP Status Code: {pdb_response.status_code}")
             return None
 
     except requests.exceptions.Timeout:
-        print("Request timed out. Please try again later.")
+        logger.error("Request timed out. Please try again later.")
         return None
     except requests.exceptions.RequestException as e:
-        print(f"An error occurred while fetching the PDB file: {e}")
+        logger.error(f"An error occurred while fetching the PDB file: {e}")
         return None
     except ValueError as ve:
-        print(f"JSON decoding failed: {ve}")
+        logger.error(f"JSON decoding failed: {ve}")
         return None
 
 def get_protein_data(accession: str) -> dict:
