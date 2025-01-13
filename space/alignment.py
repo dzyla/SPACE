@@ -133,6 +133,7 @@ def perform_alignment(proteins_list: list, reference_seq: str) -> tuple:
                 progress_bar.progress(processed_sequences / total_sequences)
     except Exception as e:
         st.error(f"An error occurred during alignment: {e}")
+        logging.error("Exception occurred during alignment", exc_info=True)
         print(traceback.format_exc())
         return None, None
 
@@ -140,6 +141,7 @@ def perform_alignment(proteins_list: list, reference_seq: str) -> tuple:
 
     if alignment_errors:
         st.warning(f"Failed to align {len(alignment_errors)} sequences.")
+        logging.warning(f"Failed to align {len(alignment_errors)} sequences.")
 
     if not scores:
         st.error("No successful alignments were performed.")

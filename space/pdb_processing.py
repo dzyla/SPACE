@@ -76,267 +76,270 @@ def process_pdb_chain(
     Raises:
         Exception: If any error occurs during processing.
     """
+    try:
+        # Ensure default_score is set correctly
+        default_score = al2co_score["al2co_score"].max()
 
-    # Ensure default_score is set correctly
-    default_score = al2co_score["al2co_score"].max()
+        # Validate the input sequence
+        if not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWY]+", seq):
+            st.error("Invalid sequence. Only standard amino acids are supported.")
+            raise ValueError("Invalid sequence. Only standard amino acids are supported.")
 
-    # Validate the input sequence
-    if not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWY]+", seq):
-        st.error("Invalid sequence. Only standard amino acids are supported.")
-        raise ValueError("Invalid sequence. Only standard amino acids are supported.")
-
-    # Determine PDB source
-    if own_pdb:
-        # Use user-provided PDB file
-        pdb_filename = own_pdb
-        selected_pdb = "Custom PDB"
-        metadata = {
-            "pdb_id": "Custom PDB",
-            "title": "Custom PDB",
-            "authors": "User",
-            "date": "N/A",
-        }
-    elif uniprot_id:
-        # Download AlphaFold PDB
-        if download_alphafold_pdb(uniprot_id):
-            pdb_filename = f"selected.pdb"
-            selected_pdb = uniprot_id
-            uniprot_meta_data = get_protein_data(uniprot_id)
-            uniprot_name = uniprot_meta_data.get('proteinDescription', {}).get('recommendedName', {}).get('fullName', {}).get('value', 'N/A')
-
+        # Determine PDB source
+        if own_pdb:
+            # Use user-provided PDB file
+            pdb_filename = own_pdb
+            selected_pdb = "Custom PDB"
             metadata = {
-                "pdb_id": f'{uniprot_id} (UniProt)',
-                "title": uniprot_name,
-                "authors": "AlphaFold Server",
+                "pdb_id": "Custom PDB",
+                "title": "Custom PDB",
+                "authors": "User",
                 "date": "N/A",
             }
-        else:
-            raise ValueError("Failed to download AlphaFold PDB file. No PDB found.")
-    else:
-        # Perform sequence search using RCSB Search API
-        try:
-            from rcsbsearchapi.search import SequenceQuery
+        elif uniprot_id:
+            # Download AlphaFold PDB
+            if download_alphafold_pdb(uniprot_id):
+                pdb_filename = f"selected.pdb"
+                selected_pdb = uniprot_id
+                uniprot_meta_data = get_protein_data(uniprot_id)
+                uniprot_name = uniprot_meta_data.get('proteinDescription', {}).get('recommendedName', {}).get('fullName', {}).get('value', 'N/A')
 
-            results = SequenceQuery(seq, 10, sequence_score)
-            pdb_ids = [x.split("_")[0] for x in results("polymer_entity")]
+                metadata = {
+                    "pdb_id": f'{uniprot_id} (UniProt)',
+                    "title": uniprot_name,
+                    "authors": "AlphaFold Server",
+                    "date": "N/A",
+                }
+            else:
+                raise ValueError("Failed to download AlphaFold PDB file. No PDB found.")
+        else:
+            # Perform sequence search using RCSB Search API
+            try:
+                from rcsbsearchapi.search import SequenceQuery
+
+                results = SequenceQuery(seq, 10, sequence_score)
+                pdb_ids = [x.split("_")[0] for x in results("polymer_entity")]
+            except Exception as e:
+                st.error(f"An error occurred during PDB search: {e}")
+                raise e
+
+            if not pdb_ids:
+                raise ValueError(
+                    "No PDB entries found matching the provided sequence and score threshold. Try AlphaFold instead."
+                )
+
+            # Allow user to select a PDB ID from search results via Streamlit
+            selected_pdb = st_column.selectbox("Select a PDB ID", pdb_ids)
+
+            try:
+                pdb_data_url = f"https://data.rcsb.org/rest/v1/core/entry/{selected_pdb}"
+                data_response = requests.get(pdb_data_url)
+                data_response.raise_for_status()
+                metadata_json = data_response.json()
+                metadata = {
+                    "pdb_id": selected_pdb,
+                    "title": metadata_json.get("struct", {}).get("title", "N/A"),
+                    "authors": ", ".join(
+                        metadata_json.get("citation", [{}])[0].get("rcsb_authors", [])
+                    ),
+                    "date": metadata_json.get("rcsb_accession_info", {}).get(
+                        "initial_deposition_date", "N/A"
+                    ),
+                }
+            except requests.exceptions.RequestException:
+                metadata = {
+                    "pdb_id": selected_pdb,
+                    "title": "N/A",
+                    "authors": "N/A",
+                    "date": "N/A",
+                }
+                st.warning("Failed to fetch PDB metadata.")
+
+            # Download the Selected PDB File
+            try:
+                pdb_url = f"https://files.rcsb.org/download/{selected_pdb}.pdb"
+                response = requests.get(pdb_url)
+                response.raise_for_status()
+                pdb_content = response.text
+                pdb_filename = f"selected.pdb"
+                with open(pdb_filename, "w") as file:
+                    file.write(pdb_content)
+            except requests.exceptions.RequestException as e:
+                st.error(f"Failed to download PDB file: {e}")
+                raise e
+
+        # Parse the PDB using BioPandas
+        try:
+            ppdb = PandasPdb().read_pdb(pdb_filename)
+            atom_df = ppdb.df["ATOM"]
         except Exception as e:
-            st.error(f"An error occurred during PDB search: {e}")
+            st.error(f"An error occurred while parsing the PDB file: {e}")
             raise e
 
-        if not pdb_ids:
-            raise ValueError(
-                "No PDB entries found matching the provided sequence and score threshold. Try AlphaFold instead."
+        # Extract unique chains
+        chains = atom_df["chain_id"].unique()
+
+        chain_scores = {}
+        chain_alignments = {}
+        chain_sequences = {}
+
+        # Amino acid 3-letter to 1-letter mapping
+        aa_3to1 = {
+            "ALA": "A",
+            "CYS": "C",
+            "ASP": "D",
+            "GLU": "E",
+            "PHE": "F",
+            "GLY": "G",
+            "HIS": "H",
+            "ILE": "I",
+            "LYS": "K",
+            "LEU": "L",
+            "MET": "M",
+            "ASN": "N",
+            "PRO": "P",
+            "GLN": "Q",
+            "ARG": "R",
+            "SER": "S",
+            "THR": "T",
+            "VAL": "V",
+            "TRP": "W",
+            "TYR": "Y",
+            "SEC": "U",
+            "PYL": "O",
+            "ASX": "B",
+            "GLX": "Z",
+            "XLE": "J",
+            "XAA": "X",
+        }
+
+        # Initialize the aligner
+        aligner = Align.PairwiseAligner()
+        aligner.mode = "global"
+        aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+        aligner.open_gap_score = -10
+        aligner.extend_gap_score = -0.5
+
+        for chain in chains:
+            # Filter atoms for the current chain
+            chain_atoms = atom_df[atom_df["chain_id"] == chain]
+
+            # Sort by residue number and insertion code
+            chain_atoms = chain_atoms.sort_values(by=["residue_number", "insertion"])
+
+            # Get unique residues
+            residues = chain_atoms["residue_number"].unique()
+
+            sequence = ""
+            for res_num in residues:
+                res = chain_atoms[chain_atoms["residue_number"] == res_num].iloc[0]
+                resname = res["residue_name"].strip()
+                aa = aa_3to1.get(resname, "X")  # Use 'X' for unknown amino acids
+                sequence += aa
+
+            if not sequence:
+                st.warning(f"Chain `{chain}` has no detectable sequence. Skipping.")
+                continue  # Skip chains with no detectable sequence
+
+            # Store the sequence for later use
+            chain_sequences[chain] = sequence
+
+            # Perform pairwise alignment
+            alignments = aligner.align(seq, sequence)
+            top_alignment = next(iter(alignments), None)
+
+            if top_alignment:
+                score = top_alignment.score
+                chain_scores[chain] = score
+                chain_alignments[chain] = top_alignment
+
+        if not chain_scores:
+            st.error("No valid chains with detectable sequences found in the PDB.")
+            raise ValueError("No valid chains found.")
+
+        # Initialize a directory to save updated PDB files
+        output_dir = "PDB_processing"
+        os.makedirs(output_dir, exist_ok=True)
+
+        chain_data = {}
+
+        for chain in chain_scores.keys():
+            alignment = chain_alignments[chain]
+            alignment_score = chain_scores[chain]
+
+            # Map residues between reference and target sequences
+            residue_map = {}
+            for (ref_start, ref_end), (target_start, target_end) in zip(
+                alignment.aligned[0], alignment.aligned[1]
+            ):
+                for ref_idx, target_idx in zip(
+                    range(ref_start, ref_end), range(target_start, target_end)
+                ):
+                    residue_map[ref_idx + 1] = target_idx + 1  # 1-based indexing
+
+            resi_scores = {}
+            for resi in al2co_score["Location"]:
+                mapped_residue = residue_map.get(resi, None)
+                if mapped_residue is not None:
+                    try:
+                        score = al2co_score[al2co_score["Location"] == resi][
+                            "al2co_score"
+                        ].values[0]
+                        resi_scores[mapped_residue] = score
+                    except Exception:
+                        resi_scores[mapped_residue] = default_score
+
+            # Update B-factors in the chain
+            chain_atoms = atom_df[atom_df["chain_id"] == chain].copy()
+            unique_residues = chain_atoms["residue_number"].unique()
+
+            for res_num in unique_residues:
+                score = resi_scores.get(res_num, default_score)
+                chain_atoms.loc[
+                    chain_atoms["residue_number"] == res_num, "b_factor"
+                ] = score
+
+            # Include HETATM records if any
+            selected_ppdb = PandasPdb()
+            selected_ppdb.df["ATOM"] = chain_atoms
+            if "HETATM" in ppdb.df:
+                chain_hetatm = ppdb.df["HETATM"][
+                    ppdb.df["HETATM"]["chain_id"] == chain
+                ]
+                selected_ppdb.df["HETATM"] = chain_hetatm
+
+            # Save the updated PDB file for the chain
+            updated_pdb_path = os.path.join(
+                output_dir, f"selected_al2co_labeled_chain_{chain}.pdb"
+            )
+            selected_ppdb.to_pdb(
+                path=updated_pdb_path, records=["ATOM", "HETATM"], gz=False
             )
 
-        # Allow user to select a PDB ID from search results via Streamlit
-        selected_pdb = st_column.selectbox("Select a PDB ID", pdb_ids)
-
-        try:
-            pdb_data_url = f"https://data.rcsb.org/rest/v1/core/entry/{selected_pdb}"
-            data_response = requests.get(pdb_data_url)
-            data_response.raise_for_status()
-            metadata_json = data_response.json()
-            metadata = {
-                "pdb_id": selected_pdb,
-                "title": metadata_json.get("struct", {}).get("title", "N/A"),
-                "authors": ", ".join(
-                    metadata_json.get("citation", [{}])[0].get("rcsb_authors", [])
-                ),
-                "date": metadata_json.get("rcsb_accession_info", {}).get(
-                    "initial_deposition_date", "N/A"
-                ),
+            # Store the data in chain_data
+            chain_data[chain] = {
+                "alignment_score": alignment_score,
+                "alignment": alignment,
+                "residue_score_map": resi_scores,
+                "updated_pdb_path": updated_pdb_path,
             }
-        except requests.exceptions.RequestException:
-            metadata = {
-                "pdb_id": selected_pdb,
-                "title": "N/A",
-                "authors": "N/A",
-                "date": "N/A",
-            }
-            st.warning("Failed to fetch PDB metadata.")
 
-        # Download the Selected PDB File
-        try:
-            pdb_url = f"https://files.rcsb.org/download/{selected_pdb}.pdb"
-            response = requests.get(pdb_url)
-            response.raise_for_status()
-            pdb_content = response.text
-            pdb_filename = f"selected.pdb"
-            with open(pdb_filename, "w") as file:
-                file.write(pdb_content)
-        except requests.exceptions.RequestException as e:
-            st.error(f"Failed to download PDB file: {e}")
-            raise e
+        # Clean up the original downloaded PDB file if it was downloaded
+        if not own_pdb:
+            try:
+                os.remove(pdb_filename)
+            except OSError:
+                pass  # If file doesn't exist, ignore
 
-    # Parse the PDB using BioPandas
-    try:
-        ppdb = PandasPdb().read_pdb(pdb_filename)
-        atom_df = ppdb.df["ATOM"]
-    except Exception as e:
-        st.error(f"An error occurred while parsing the PDB file: {e}")
-        raise e
-
-    # Extract unique chains
-    chains = atom_df["chain_id"].unique()
-
-    chain_scores = {}
-    chain_alignments = {}
-    chain_sequences = {}
-
-    # Amino acid 3-letter to 1-letter mapping
-    aa_3to1 = {
-        "ALA": "A",
-        "CYS": "C",
-        "ASP": "D",
-        "GLU": "E",
-        "PHE": "F",
-        "GLY": "G",
-        "HIS": "H",
-        "ILE": "I",
-        "LYS": "K",
-        "LEU": "L",
-        "MET": "M",
-        "ASN": "N",
-        "PRO": "P",
-        "GLN": "Q",
-        "ARG": "R",
-        "SER": "S",
-        "THR": "T",
-        "VAL": "V",
-        "TRP": "W",
-        "TYR": "Y",
-        "SEC": "U",
-        "PYL": "O",
-        "ASX": "B",
-        "GLX": "Z",
-        "XLE": "J",
-        "XAA": "X",
-    }
-
-    # Initialize the aligner
-    aligner = Align.PairwiseAligner()
-    aligner.mode = "global"
-    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
-    aligner.open_gap_score = -10
-    aligner.extend_gap_score = -0.5
-
-    for chain in chains:
-        # Filter atoms for the current chain
-        chain_atoms = atom_df[atom_df["chain_id"] == chain]
-
-        # Sort by residue number and insertion code
-        chain_atoms = chain_atoms.sort_values(by=["residue_number", "insertion"])
-
-        # Get unique residues
-        residues = chain_atoms["residue_number"].unique()
-
-        sequence = ""
-        for res_num in residues:
-            res = chain_atoms[chain_atoms["residue_number"] == res_num].iloc[0]
-            resname = res["residue_name"].strip()
-            aa = aa_3to1.get(resname, "X")  # Use 'X' for unknown amino acids
-            sequence += aa
-
-        if not sequence:
-            st.warning(f"Chain `{chain}` has no detectable sequence. Skipping.")
-            continue  # Skip chains with no detectable sequence
-
-        # Store the sequence for later use
-        chain_sequences[chain] = sequence
-
-        # Perform pairwise alignment
-        alignments = aligner.align(seq, sequence)
-        top_alignment = next(iter(alignments), None)
-
-        if top_alignment:
-            score = top_alignment.score
-            chain_scores[chain] = score
-            chain_alignments[chain] = top_alignment
-
-    if not chain_scores:
-        st.error("No valid chains with detectable sequences found in the PDB.")
-        raise ValueError("No valid chains found.")
-
-    # Initialize a directory to save updated PDB files
-    output_dir = "PDB_processing"
-    os.makedirs(output_dir, exist_ok=True)
-
-    chain_data = {}
-
-    for chain in chain_scores.keys():
-        alignment = chain_alignments[chain]
-        alignment_score = chain_scores[chain]
-
-        # Map residues between reference and target sequences
-        residue_map = {}
-        for (ref_start, ref_end), (target_start, target_end) in zip(
-            alignment.aligned[0], alignment.aligned[1]
-        ):
-            for ref_idx, target_idx in zip(
-                range(ref_start, ref_end), range(target_start, target_end)
-            ):
-                residue_map[ref_idx + 1] = target_idx + 1  # 1-based indexing
-
-        resi_scores = {}
-        for resi in al2co_score["Location"]:
-            mapped_residue = residue_map.get(resi, None)
-            if mapped_residue is not None:
-                try:
-                    score = al2co_score[al2co_score["Location"] == resi][
-                        "al2co_score"
-                    ].values[0]
-                    resi_scores[mapped_residue] = score
-                except Exception:
-                    resi_scores[mapped_residue] = default_score
-
-        # Update B-factors in the chain
-        chain_atoms = atom_df[atom_df["chain_id"] == chain].copy()
-        unique_residues = chain_atoms["residue_number"].unique()
-
-        for res_num in unique_residues:
-            score = resi_scores.get(res_num, default_score)
-            chain_atoms.loc[
-                chain_atoms["residue_number"] == res_num, "b_factor"
-            ] = score
-
-        # Include HETATM records if any
-        selected_ppdb = PandasPdb()
-        selected_ppdb.df["ATOM"] = chain_atoms
-        if "HETATM" in ppdb.df:
-            chain_hetatm = ppdb.df["HETATM"][
-                ppdb.df["HETATM"]["chain_id"] == chain
-            ]
-            selected_ppdb.df["HETATM"] = chain_hetatm
-
-        # Save the updated PDB file for the chain
-        updated_pdb_path = os.path.join(
-            output_dir, f"selected_al2co_labeled_chain_{chain}.pdb"
-        )
-        selected_ppdb.to_pdb(
-            path=updated_pdb_path, records=["ATOM", "HETATM"], gz=False
-        )
-
-        # Store the data in chain_data
-        chain_data[chain] = {
-            "alignment_score": alignment_score,
-            "alignment": alignment,
-            "residue_score_map": resi_scores,
-            "updated_pdb_path": updated_pdb_path,
+        return {
+            "metadata": metadata,
+            "selected_pdb": selected_pdb,
+            "chain_data": chain_data,
         }
-
-    # Clean up the original downloaded PDB file if it was downloaded
-    if not own_pdb:
-        try:
-            os.remove(pdb_filename)
-        except OSError:
-            pass  # If file doesn't exist, ignore
-
-    return {
-        "metadata": metadata,
-        "selected_pdb": selected_pdb,
-        "chain_data": chain_data,
-    }
-
+    except Exception as e:
+        st.error(f"An error occurred during PDB processing: {e}")
+        print(traceback.format_exc())
+        raise e
 
 
 def extract_uniprot_ids(names_list: List[str], include_version: bool = True) -> List[str]:

@@ -12,6 +12,11 @@ import streamlit as st
 from .utils import clean_fasta
 from Bio import AlignIO, Align, SeqIO
 import plotly.express as px
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def run_al2co(al2co_path: str, alignment_file: str, al2co_output: str) -> Optional[str]:
     try:
@@ -28,12 +33,15 @@ def run_al2co(al2co_path: str, alignment_file: str, al2co_output: str) -> Option
             return al2co_output
     except subprocess.CalledProcessError as e:
         st.error(f"An error occurred while running al2co.exe: {e.stderr}")
+        logger.error("Exception occurred while running al2co.exe", exc_info=True)
         raise e
     except FileNotFoundError:
         st.error("al2co.exe not found. Please ensure the path is correct.")
+        logger.error("al2co.exe not found. Please ensure the path is correct.")
         raise FileNotFoundError("al2co.exe not found.")
     except Exception as e:
         st.error(f"An unexpected error occurred while running al2co.exe: {e}")
+        logger.error("Unexpected error occurred while running al2co.exe", exc_info=True)
         raise e
 
 def parse_al2co_output(al2co_file: str) -> pd.DataFrame:
