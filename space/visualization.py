@@ -3,6 +3,7 @@
 import re
 import numpy as np
 import pandas as pd
+import os
 import plotly.express as px
 import plotly.graph_objects as go
 import seaborn as sns
@@ -16,7 +17,7 @@ from typing import List, Optional
 import py3Dmol
 from stmol import showmol
 
-def visualize_al2co_seaborn(al2co_df: pd.DataFrame):
+def visualize_al2co_seaborn(al2co_df: pd.DataFrame, folder: str = None):
     """
     Visualizes al2co conservation scores using Seaborn.
 
@@ -64,7 +65,7 @@ def visualize_al2co_seaborn(al2co_df: pd.DataFrame):
 
     st.pyplot(fig)
 
-def visualize_al2co_plotly(al2co_df: pd.DataFrame):
+def visualize_al2co_plotly(al2co_df: pd.DataFrame, folder: str = None):
     """
     Visualizes al2co conservation scores using Plotly with a customized colorscale.
 
@@ -137,7 +138,7 @@ def visualize_al2co_plotly(al2co_df: pd.DataFrame):
         hovermode="closest",
         height=600,
     )
-    fig.write_html("al2co_plot.html")
+    fig.write_html(os.path.join(folder, "al2co_plot.html"))
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -273,7 +274,7 @@ def msa_to_image(msa_file: str) -> tuple:
     return msa_image, msa_letters
 
 
-def plot_msa_image(msa_image: np.ndarray, msa_letters: np.ndarray):
+def plot_msa_image(msa_image: np.ndarray, msa_letters: np.ndarray, folder: str = './'):
     """
     Plots the Multiple Sequence Alignment (MSA) as a heatmap with amino acid hover information.
 
@@ -328,7 +329,7 @@ def plot_msa_image(msa_image: np.ndarray, msa_letters: np.ndarray):
     )
 
     # Save the plot as an HTML file (optional)
-    fig.write_html("msa_plot.html")
+    fig.write_html(os.path.join(folder, "msa_plot.html"))
 
     # Display the plot in Streamlit
     st.plotly_chart(fig, use_container_width=True)

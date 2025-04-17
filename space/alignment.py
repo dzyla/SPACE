@@ -396,7 +396,7 @@ def analyze_alignment(alignment_file: str, reference_seq: str) -> pd.DataFrame:
 
 
 def generate_phylogenetic_tree(
-    msa_file: str, use_random_subsample: bool = False
+    msa_file: str, use_random_subsample: bool = False, folder: str = "."
 ) -> Optional[str]:
     """
     Generates a phylogenetic tree from a Multiple Sequence Alignment (MSA) file using Biopython.
@@ -455,7 +455,7 @@ def generate_phylogenetic_tree(
         logger.info("Phylogenetic tree constructed")
 
         # Save the tree in Newick format
-        tree_file = "phylogenetic_tree.nwk"
+        tree_file = os.path.join(folder, "phylogenetic_tree.nwk")
         Phylo.write(tree, tree_file, "newick")
         logger.info("Phylogenetic tree saved to %s", tree_file)
 
