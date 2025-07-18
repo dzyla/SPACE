@@ -39,7 +39,9 @@ pip install streamlit py3Dmol stmol pandas biopython plotly kaleido scipy biopan
 
 To run SPACE execute the following command:
 
-```bash 
+```bash
 streamlit run app.py
 ```
+
+When launching the app you can now provide sequences from NCBI, UniProt or by uploading your own FASTA file. Choose **Upload FASTA** in the data source selector and then provide a file containing the sequences you wish to analyze.
 

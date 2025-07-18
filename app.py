@@ -159,8 +159,17 @@ def main():
             autocomplete="email",
             placeholder="Your@email.com",
         )
-        data_source = st.selectbox("Select data source:", ["NCBI", "UniProt"])
-        query = st.text_input("Enter your query:", "Hendra henipavirus F")
+        data_source = st.selectbox(
+            "Select data source:", ["NCBI", "UniProt", "Upload FASTA"]
+        )
+        uploaded_fasta = None
+        if data_source == "Upload FASTA":
+            uploaded_fasta = st.file_uploader(
+                "Upload FASTA file:", type=["fasta", "fa", "faa"]
+            )
+            query = ""
+        else:
+            query = st.text_input("Enter your query:", "Hendra henipavirus F")
         sc1, sc2 = st.columns(2)
         use_refseq = sc1.checkbox("Use RefSeq database", value=False)
         remove_PDB = sc2.checkbox("Remove PDB entries from MSA", value=False)
@@ -222,7 +231,7 @@ def main():
         submit_button = st.form_submit_button(label="Fetch Sequences")
 
     if submit_button:
-        if not email:
+        if data_source != "Upload FASTA" and not email:
             st.sidebar.error("Email is required for NCBI Entrez access.")
         else:
             welcome.empty()
@@ -240,10 +249,18 @@ def main():
                                 max_seqs=max_seqs,
                                 use_refseq=use_refseq,
                             )
-                        else:
+                        elif data_source == "UniProt":
                             file_path = search_and_save_protein_uniprot(
                                 query, filename, max_seqs=max_seqs
                             )
+                        else:
+                            if uploaded_fasta is None:
+                                st.error("Please upload a FASTA file.")
+                                file_path = None
+                            else:
+                                file_path = filename
+                                with open(file_path, "wb") as f:
+                                    f.write(uploaded_fasta.getbuffer())
                     if file_path:
                         proteins_list = get_protein_sequences(
                             file_path, remove_PDB=remove_PDB
