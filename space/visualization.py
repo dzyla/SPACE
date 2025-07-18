@@ -1,5 +1,6 @@
 # visualization.py
 
+import os
 import re
 import numpy as np
 import pandas as pd
@@ -63,8 +64,7 @@ def visualize_al2co_seaborn(al2co_df: pd.DataFrame):
     cbar.set_label("Conservation Score")
 
     st.pyplot(fig)
-
-def visualize_al2co_plotly(al2co_df: pd.DataFrame):
+def visualize_al2co_plotly(al2co_df: pd.DataFrame, folder: str = "."):
     """
     Visualizes al2co conservation scores using Plotly with a customized colorscale.
 
@@ -137,7 +137,7 @@ def visualize_al2co_plotly(al2co_df: pd.DataFrame):
         hovermode="closest",
         height=600,
     )
-    fig.write_html("al2co_plot.html")
+    fig.write_html(os.path.join(folder, "al2co_plot.html"))
 
     st.plotly_chart(fig, use_container_width=True)
 

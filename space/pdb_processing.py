@@ -55,6 +55,7 @@ def process_pdb_chain(
     uniprot_id: str = None,
     own_pdb: str = None,
     st_column: Optional = None,
+    output_dir: str = "PDB_processing",
 ) -> dict:
     """
     Processes a protein sequence to find matching PDB chains, maps al2co scores,
@@ -98,7 +99,7 @@ def process_pdb_chain(
         }
     elif uniprot_id:
         # Download AlphaFold PDB
-        if download_alphafold_pdb(uniprot_id):
+        if download_alphafold_pdb(uniprot_id, save_dir=output_dir):
             pdb_filename = f"selected.pdb"
             selected_pdb = uniprot_id
             uniprot_meta_data = get_protein_data(uniprot_id)
@@ -258,7 +259,6 @@ def process_pdb_chain(
         raise ValueError("No valid chains found.")
 
     # Initialize a directory to save updated PDB files
-    output_dir = "PDB_processing"
     os.makedirs(output_dir, exist_ok=True)
 
     chain_data = {}
