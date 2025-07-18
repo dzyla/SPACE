@@ -9,6 +9,7 @@ import zipfile
 import io
 
 import streamlit as st
+import uuid
 from typing import List, Optional
 
 import py3Dmol
@@ -151,35 +152,25 @@ def main():
 
     # Sidebar inputs
     st.sidebar.header("Parameters")
+    data_source = st.sidebar.selectbox("Select data source:", ["NCBI", "UniProt", "Upload FASTA"])
     with st.sidebar.form("parameters_form"):
-        email = st.text_input(
-            "Enter your email for NCBI Entrez:",
-            value="",
-            help="Required for accessing NCBI databases.",
-            autocomplete="email",
-            placeholder="Your@email.com",
-        )
-        data_source = st.selectbox(
-            "Select data source:", ["NCBI", "UniProt", "Upload FASTA"]
-        )
+        if data_source == "NCBI":
+            email = st.text_input("Enter your email for NCBI Entrez:", value="", help="Required for accessing NCBI databases.", autocomplete="email", placeholder="Your@email.com")
+        else:
+            email = None
         uploaded_fasta = None
         if data_source == "Upload FASTA":
-            uploaded_fasta = st.file_uploader(
-                "Upload FASTA file:", type=["fasta", "fa", "faa"]
-            )
+            uploaded_fasta = st.file_uploader("Upload FASTA file:", type=["fasta", "fa", "faa"])
             query = ""
         else:
             query = st.text_input("Enter your query:", "Hendra henipavirus F")
         sc1, sc2 = st.columns(2)
-        use_refseq = sc1.checkbox("Use RefSeq database", value=False)
+        if data_source != "Upload FASTA":
+            use_refseq = sc1.checkbox("Use RefSeq database", value=False)
+        else:
+            use_refseq = False
         remove_PDB = sc2.checkbox("Remove PDB entries from MSA", value=False)
-        max_seqs = st.number_input(
-            "Enter maximum number of sequences to fetch (-1 for all):",
-            min_value=-1,
-            value=100,
-            step=1,
-        )
-
+        max_seqs = st.number_input("Enter maximum number of sequences to fetch (-1 for all):", min_value=-1, value=100, step=1)
         # defining the default path for al2co executable
         # detect whether it is windows or linux
         system = platform.system()
@@ -231,7 +222,7 @@ def main():
         submit_button = st.form_submit_button(label="Fetch Sequences")
 
     if submit_button:
-        if data_source != "Upload FASTA" and not email:
+        if data_source == "NCBI" and not email:
             st.sidebar.error("Email is required for NCBI Entrez access.")
         else:
             welcome.empty()
@@ -239,7 +230,11 @@ def main():
                 clustalo_path_resolved = get_clustalo_path(clustalo_path)
                 al2co_path_resolved = get_al2co_path(al2co_path)
                 if clustalo_path_resolved and al2co_path_resolved:
-                    filename = "sequences.fasta"
+                    session_id = uuid.uuid4().hex
+                    session_dir = os.path.join("sessions", session_id)
+                    os.makedirs(session_dir, exist_ok=True)
+                    st.session_state.session_dir = session_dir
+                    filename = os.path.join(session_dir, "sequences.fasta")
                     with st.spinner("Fetching sequences..."):
                         if data_source == "NCBI":
                             file_path = search_and_save_protein_ncbi(
@@ -261,33 +256,29 @@ def main():
                                 file_path = filename
                                 with open(file_path, "wb") as f:
                                     f.write(uploaded_fasta.getbuffer())
-                    if file_path:
-                        proteins_list = get_protein_sequences(
-                            file_path, remove_PDB=remove_PDB
-                        )
-                        st.session_state.proteins_list = proteins_list
-                        st.session_state.reference_seq_input = None
-                        st.session_state.result = None
-                        st.session_state.reference_seq = None
-                        st.session_state.msa_done = False
-                        st.session_state.filtered = False
-                        st.session_state.msa_df = None
-                        st.session_state.msa_image = None
-                        st.session_state.msa_letters = None
-                        st.session_state.msa_outfile = None
-                        st.session_state.al2co_output = None
-                        st.session_state.al2co_df = None
-                        st.session_state.alignment_mapping = (
-                            None  # Reset alignment mapping
-                        )
-                        st.session_state.unique_mutations = {}
-                        st.session_state.excluded_sequences = {}
-                        st.session_state.mutation_summary = set()
-                        st.session_state.all_mutations_str = ""
-                        st.session_state.phylogenetic_tree = (
-                            None  # Reset phylogenetic_tree
-                        )
-                        st.success("Sequences fetched and saved successfully.")
+                        if file_path:
+                            proteins_list = get_protein_sequences(
+                                file_path, remove_PDB=remove_PDB
+                            )
+                            st.session_state.proteins_list = proteins_list
+                            st.session_state.reference_seq_input = None
+                            st.session_state.result = None
+                            st.session_state.reference_seq = None
+                            st.session_state.msa_done = False
+                            st.session_state.filtered = False
+                            st.session_state.msa_df = None
+                            st.session_state.msa_image = None
+                            st.session_state.msa_letters = None
+                            st.session_state.msa_outfile = None
+                            st.session_state.al2co_output = None
+                            st.session_state.al2co_df = None
+                            st.session_state.alignment_mapping = None
+                            st.session_state.unique_mutations = {}
+                            st.session_state.excluded_sequences = {}
+                            st.session_state.mutation_summary = set()
+                            st.session_state.all_mutations_str = ""
+                            st.session_state.phylogenetic_tree = None
+                            st.success("Sequences fetched and saved successfully." )
             except Exception as e:
                 st.error(f"An error occurred: {e}")
                 print(traceback.format_exc())
@@ -516,9 +507,8 @@ def main():
                     )
 
                     if high_score_seqs:
-                        msa_infile = "msa_in.fasta"
-                        msa_outfile = "msa_out.fasta"
-                        clustalo_path_resolved = get_clustalo_path(clustalo_path)
+                        msa_infile = os.path.join(st.session_state.session_dir, "msa_in.fasta")
+                        msa_outfile = os.path.join(st.session_state.session_dir, "msa_out.fasta")
                         max_threads = min(os.cpu_count(), 16) or 4
                         if clustalo_path_resolved:
                             msa_outfile = perform_msa_and_fix_header(
@@ -548,7 +538,7 @@ def main():
                             # Run al2co.exe
                             al2co_path_resolved = get_al2co_path(al2co_path)
                             if al2co_path_resolved:
-                                al2co_output = "al2co_output.txt"
+                                al2co_output = os.path.join(st.session_state.session_dir, "al2co_output.txt")
                                 al2co_result = run_al2co(
                                     al2co_path_resolved,
                                     msa_outfile.replace("fasta", "aln"),
@@ -619,7 +609,7 @@ def main():
                 if plot_al2co_type == "Seaborn":
                     visualize_al2co_seaborn(st.session_state.al2co_df)
                 else:
-                    visualize_al2co_plotly(st.session_state.al2co_df)
+                    visualize_al2co_plotly(st.session_state.al2co_df, st.session_state.session_dir)
 
     # Display Mutation Information
     if st.session_state.get("unique_mutations"):
@@ -645,13 +635,13 @@ def main():
         # Save mutation data into CSV files
         mutations_df_export = get_mutation_dataframe()
         if not mutations_df_export.empty:
-            mutations_df_export.to_csv("point_mutations.csv", index=False, sep="\t")
+            mutations_df_export.to_csv(os.path.join(st.session_state.session_dir, "point_mutations.csv"), index=False, sep="\t")
             st.success("Point mutations saved to `point_mutations.csv`.")
 
         # Create unique mutations DataFrame
         unique_mutations_df = mutations_df_export.drop_duplicates(subset=["Mutation"])
         if not unique_mutations_df.empty:
-            unique_mutations_df.to_csv("unique_point_mutations.csv", index=False)
+            unique_mutations_df.to_csv(os.path.join(st.session_state.session_dir, 'unique_point_mutations.csv'), index=False)
             st.success("Unique point mutations saved to `unique_point_mutations.csv`.")
 
         c1, c2 = st.columns(2)
@@ -785,6 +775,7 @@ def main():
                         frequency_threshold=frequency_threshold,
                         own_pdb=pdb_file_path,
                         st_column=c11,
+                        output_dir=os.path.join(st.session_state.session_dir, "PDB_processing"),
                     )
                 else:
                     result = process_pdb_chain(
@@ -794,8 +785,8 @@ def main():
                         frequency_threshold=frequency_threshold,
                         uniprot_id=uniprot_id,
                         st_column=c11,
+                        output_dir=os.path.join(st.session_state.session_dir, "PDB_processing"),
                     )
-
             # Display Metadata
             c1.write("### PDB Metadata")
             c1.write(f"**PDB ID:** {result['metadata']['pdb_id']}")
@@ -931,28 +922,27 @@ def main():
                 f"Job ran at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
 
-        pdbs = glob.glob("./PDB_processing/*.pdb")
         # Collect all relevant file paths
         file_paths = [
-            "sequences.fasta",
-            "msa_in.fasta",
-            "msa_out.fasta",
-            "msa_out.aln",
-            "al2co_output.txt",
-            "msa_plot.html",
-            "al2co_plot.html",
-            "point_mutations.csv",
-            "unique_point_mutations.csv",
-            "mutations_scatter.html",
-            "selected_al2co_labeled.pdb",
-            "phylogenetic_tree.nwk",
-            "phylogenetic_tree.html",
-            f"{clean_string_for_path(query)}.txt",
+            os.path.join(st.session_state.session_dir, fname) for fname in [
+                "sequences.fasta",
+                "msa_in.fasta",
+                "msa_out.fasta",
+                "msa_out.aln",
+                "al2co_output.txt",
+                "msa_plot.html",
+                "al2co_plot.html",
+                "point_mutations.csv",
+                "unique_point_mutations.csv",
+                "mutations_scatter.html",
+                "selected_al2co_labeled.pdb",
+                "phylogenetic_tree.nwk",
+                "phylogenetic_tree.html",
+                f"{clean_string_for_path(query)}.txt",
+            ]
         ]
-
+        pdbs = glob.glob(os.path.join(st.session_state.session_dir, "PDB_processing", "*.pdb"))
         file_paths += pdbs
-        # Remove any None or non-existing files
-        file_paths = [file for file in file_paths if file and os.path.exists(file)]
 
         if file_paths:
             # Create zip in memory
