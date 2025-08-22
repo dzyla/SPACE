@@ -1,0 +1,9 @@
+.streamlit/
+*.aln
+*.log
+*.fasta
+*.html
+*.nwk
+*.csv
+*.txt
+space/__pycache__/*
