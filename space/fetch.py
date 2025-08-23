@@ -41,7 +41,6 @@ def search_and_save_protein_ncbi(
         id_list_original = search_results_original.get("IdList", [])
         handle_original.close()
 
-        st.success(f"Found {len(id_list_original)} IDs from original NCBI search.")
 
         swissprot_query = f"{query} AND swissprot[filter]"
         handle_swissprot = Entrez.esearch(
@@ -54,17 +53,20 @@ def search_and_save_protein_ncbi(
         search_results_swissprot = Entrez.read(handle_swissprot, ignore_errors=True)
         id_list_swissprot = search_results_swissprot.get("IdList", [])
         handle_swissprot.close()
-
-        st.success(f"Found {len(id_list_swissprot)} IDs from Swiss-Prot filtered search.")
+        
+        st.success(f"Found {len(id_list_swissprot)} IDs from Swiss-Prot filtered search and {len(id_list_original)} IDs from original NCBI search.")
 
         combined_id_set = set(id_list_original) | set(id_list_swissprot)
         combined_id_list = list(combined_id_set)
 
-        st.info(f"Total unique IDs after combining both searches: {len(combined_id_list)}")
 
         if max_seqs != -1 and max_seqs < len(combined_id_list):
             combined_id_list = combined_id_list[:max_seqs]
-            st.info(f"Using first {len(combined_id_list)} IDs after applying max_seqs.")
+            st.info(f"Total unique IDs after combining both searches: {len(combined_id_list)}. Using first {len(combined_id_list)} IDs after applying max_seqs.")
+        
+        else:
+            st.info(f"Total unique IDs after combining both searches: {len(combined_id_list)}.")
+
 
         if not combined_id_list:
             st.error("No PDB entries found after combining both searches.")

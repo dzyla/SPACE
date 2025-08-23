@@ -3,6 +3,7 @@
 import datetime
 import glob
 import io
+import logging
 import os
 import platform
 import traceback
@@ -19,7 +20,7 @@ import stmol
 import streamlit as st
 from stmol import showmol
 
-from space.alignment import *
+from space.alignment import *          
 from space.analysis import *
 from space.fetch import *
 from space.pdb_processing import *
@@ -37,7 +38,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Create a per-session output directory
+logging.basicConfig(level=logging.INFO)
+
+# -----------------------------------
+# Session-scoped output directory
+# -----------------------------------
 if "session_dir" not in st.session_state:
     session_id = uuid.uuid4().hex
     session_dir = Path(f"sessions/{session_id}")
@@ -46,23 +51,23 @@ if "session_dir" not in st.session_state:
 else:
     session_dir = st.session_state.session_dir
 
+# Track outputs to simplify bundling at the end
+if "outputs" not in st.session_state:
+    st.session_state.outputs = set()
+
 def out_path(fname: str) -> str:
     """
-    Prefix all filenames with the session directory.
+    Create a path under the session directory, ensure parent exists,
+    and remember it for later zipping.
     """
-    return str(session_dir / fname)
+    path = session_dir / fname
+    path.parent.mkdir(parents=True, exist_ok=True)
+    st.session_state.outputs.add(str(path))
+    return str(path)
 
 def create_zip_file(file_paths: List[str], zip_name: str) -> Optional[io.BytesIO]:
     """
     Creates a zip file in memory from the given list of file paths.
-
-    Args:
-        file_paths (List[str]): List of file paths to include in the zip.
-        zip_name (str): The name of the resulting zip file.
-
-    Returns:
-        Optional[io.BytesIO]: The BytesIO object containing the zip file data,
-                              or None if no files.
     """
     if not file_paths:
         return None
@@ -72,7 +77,9 @@ def create_zip_file(file_paths: List[str], zip_name: str) -> Optional[io.BytesIO
         for file_path in file_paths:
             try:
                 if os.path.isfile(file_path):
-                    zip_file.write(file_path, arcname=os.path.basename(file_path))
+                    # Keep folder structure inside the zip relative to session_dir
+                    arcname = os.path.relpath(file_path, start=session_dir)
+                    zip_file.write(file_path, arcname=arcname)
                 else:
                     st.warning(f"File does not exist and will be skipped: {file_path}")
             except Exception as e:
@@ -84,34 +91,8 @@ def main():
     st.title("Sequence Protein Alignment and Conservation Engine (SPACE) :stars:")
     welcome = st.empty()
 
-    if "result" not in st.session_state:
-        welcome.markdown(
-            """
-Welcome to **Sequence Protein Alignment and Conservation Engine (SPACE)**, a tool for exploring
-and understanding protein sequences and their conservation in 2D and 3D.
-
-## Description
-
-- **Fetch Protein Sequences:** Retrieve protein sequences from databases like **NCBI** and **UniProt**.
-- **Reference Sequence Selection:** Choose or provide a reference sequence for alignment.
-- **Pairwise Alignment:** Filter sequences by alignment score.
-- **Multiple Sequence Alignment (MSA):** Perform and visualize alignments with Clustal Omega or FAMSA.
-- **Conservation Scoring:** Assess conservation using AL2CO.
-- **Mutation Analysis:** Identify unique point mutations.
-- **Phylogenetic Tree Generation:** Visualize evolutionary relationships.
-- **Structural Mapping:** Map conservation scores onto 3D structures.
-- **Download Results:** Bundle all outputs in a ZIP.
-
-## How to cite
-
-- Zyla, D. **SPACE**: Sequence Protein Alignment and Conservation Engine. Streamlit app.
-- Based on Zyla, D. et al. *Science*(2024). DOI:10.1126/science.adm8693
-"""
-        )
-    else:
-        welcome.empty()
-
     # Initialize session state
+    logging.info("Initializing session state variables.")
     if "result" not in st.session_state:
         st.session_state.update({
             "result": None,
@@ -135,7 +116,39 @@ and understanding protein sequences and their conservation in 2D and 3D.
             "show_msa": False,
         })
 
+    # Intro text shown only before results exist
+    if st.session_state.get("result") is None:
+        welcome.markdown(
+            """
+Welcome to **Sequence Protein Alignment and Conservation Engine (SPACE)**, a tool for exploring
+and understanding protein sequences and their conservation in 2D and 3D.
+
+## Description
+
+- **Fetch Protein Sequences:** Retrieve protein sequences from databases like **NCBI** and **UniProt**.
+- **Reference Sequence Selection:** Choose or provide a reference sequence for alignment.
+- **Pairwise Alignment:** Filter sequences by alignment score.
+- **Multiple Sequence Alignment (MSA):** Perform and visualize alignments with **pyfamsa**.
+- **Conservation Scoring:** Assess conservation using AL2CO.
+- **Mutation Analysis:** Identify unique point mutations.
+- **Phylogenetic Tree Generation:** Visualize evolutionary relationships.
+- **Structural Mapping:** Map conservation scores onto 3D structures.
+- **Download Results:** Bundle all outputs in a ZIP.
+
+## How to cite
+
+- Zyla, D. **SPACE**: Sequence Protein Alignment and Conservation Engine. Streamlit app.
+- Based on Zyla, D. et al. *Science*(2024). DOI:10.1126/science.adm8693
+"""
+        )
+    else:
+        welcome.empty()
+
+    logging.info(f"Session folder: {session_dir}")
+
+    # -----------------------------------
     # Sidebar inputs
+    # -----------------------------------
     st.sidebar.header("Parameters")
     with st.sidebar.form("parameters_form"):
         email = st.text_input(
@@ -158,17 +171,18 @@ and understanding protein sequences and their conservation in 2D and 3D.
             step=1,
         )
 
+        # Only AL2CO executable is needed; MSA uses pyfamsa (pure Python)
         system = platform.system()
         if system == "Windows":
-            clustalo_default = "clustalo"
             al2co_default = "al2co"
         else:
-            clustalo_default = "./exceculatbles/amd64/clustalo"
             al2co_default = "./exceculatbles/amd64/al2co"
-            os.chmod(clustalo_default, 0o777)
-            os.chmod(al2co_default, 0o777)
+            try:
+                if os.path.exists(al2co_default):
+                    os.chmod(al2co_default, 0o777)
+            except Exception:
+                pass
 
-        clustalo_path = clustalo_default
         al2co_path = st.text_input(
             "Enter the path to al2co executable:",
             value=al2co_default,
@@ -177,60 +191,62 @@ and understanding protein sequences and their conservation in 2D and 3D.
 
         submit_button = st.form_submit_button(label="Fetch Sequences")
 
-    # Fetch sequences
+    # -----------------------------------
+    # Step 1: Fetch sequences
+    # -----------------------------------
     if submit_button:
         if data_source == "NCBI" and not email:
             st.sidebar.error("Email is required for NCBI Entrez access.")
         else:
             welcome.empty()
             try:
-                clustalo_path_resolved = get_clustalo_path(clustalo_path)
-                al2co_path_resolved = get_al2co_path(al2co_path)
-                if clustalo_path_resolved and al2co_path_resolved:
-                    fasta_path = out_path("sequences.fasta")
-                    with st.spinner("Fetching sequences..."):
-                        if data_source == "NCBI":
-                            file_path = search_and_save_protein_ncbi(
-                                query,
-                                fasta_path,
-                                email,
-                                max_seqs=max_seqs,
-                                use_refseq=use_refseq,
-                            )
-                        else:
-                            file_path = search_and_save_protein_uniprot(
-                                query, fasta_path, max_seqs=max_seqs
-                            )
-                    if file_path:
-                        proteins_list = get_protein_sequences(
-                            file_path, remove_PDB=remove_PDB
+                fasta_path = out_path("msa/sequences.fasta")
+                with st.spinner("Fetching sequences..."):
+                    if data_source == "NCBI":
+                        file_path = search_and_save_protein_ncbi(
+                            query,
+                            fasta_path,
+                            email,
+                            max_seqs=max_seqs,
+                            use_refseq=use_refseq,
                         )
-                        st.session_state.proteins_list = proteins_list
-                        # Reset downstream state
-                        for key in [
-                            "result", "reference_seq", "msa_done", "filtered",
-                            "msa_df", "msa_image", "msa_letters", "msa_outfile",
-                            "al2co_output", "al2co_df", "alignment_mapping",
-                            "unique_mutations", "excluded_sequences",
-                            "mutation_summary", "all_mutations_str",
-                            "phylogenetic_tree"
-                        ]:
-                            if key == "msa_done":
-                                st.session_state[key] = False
-                            elif key in ["unique_mutations", "excluded_sequences"]:
-                                st.session_state[key] = {}
-                            elif key == "mutation_summary":
-                                st.session_state[key] = set()
-                            elif key == "all_mutations_str":
-                                st.session_state[key] = ""
-                            else:
-                                st.session_state[key] = None
-                        st.success("Sequences fetched and saved successfully.")
+                    else:
+                        file_path = search_and_save_protein_uniprot(
+                            query, fasta_path, max_seqs=max_seqs
+                        )
+
+                if file_path:
+                    proteins_list = get_protein_sequences(
+                        file_path, remove_PDB=remove_PDB
+                    )
+                    st.session_state.proteins_list = proteins_list
+                    # Reset downstream state
+                    for key in [
+                        "result", "reference_seq", "msa_done", "filtered",
+                        "msa_df", "msa_image", "msa_letters", "msa_outfile",
+                        "al2co_output", "al2co_df", "alignment_mapping",
+                        "unique_mutations", "excluded_sequences",
+                        "mutation_summary", "all_mutations_str",
+                        "phylogenetic_tree"
+                    ]:
+                        if key == "msa_done":
+                            st.session_state[key] = False
+                        elif key in ["unique_mutations", "excluded_sequences"]:
+                            st.session_state[key] = {}
+                        elif key == "mutation_summary":
+                            st.session_state[key] = set()
+                        elif key == "all_mutations_str":
+                            st.session_state[key] = ""
+                        else:
+                            st.session_state[key] = None
+                    #st.success("Sequences fetched and saved successfully.")
             except Exception as e:
                 st.error(f"An error occurred: {e}")
                 st.error(traceback.format_exc())
 
+    # -----------------------------------
     # Step 2: Reference Sequence Selection
+    # -----------------------------------
     if st.session_state.get("proteins_list") and not st.session_state.get("msa_done"):
         ref_seq_choice = st.radio(
             "Select reference sequence:",
@@ -254,7 +270,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
                 st.session_state.reference_seq = str(
                     sorted_protein_list[idx].seq
                 ).upper()
-                st.success("Reference sequence selected.")
+                #st.success("Reference sequence selected.")
         else:
             st.header("Provide Reference Sequence")
             ref = st.text_area(
@@ -289,7 +305,9 @@ and understanding protein sequences and their conservation in 2D and 3D.
                     st.error(f"An error occurred during alignment: {e}")
                     st.error(traceback.format_exc())
 
-    # Step 3: Filter & MSA
+    # -----------------------------------
+    # Step 3: Filter & MSA (pyfamsa)
+    # -----------------------------------
     if st.session_state.get("result") and not st.session_state.get("msa_done"):
         st.header("Filter Sequences")
         with st.form("Adjust Filtering Parameters"):
@@ -330,7 +348,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
             continue_button = st.form_submit_button("Continue with Alignment")
 
         if continue_button:
-            with st.spinner("Filtering sequences and performing MSA..."):
+            with st.spinner("Filtering sequences and performing MSA (pyfamsa)..."):
                 try:
                     high_score_seqs, id_array_selected, scores_final = filter_sequences(
                         st.session_state.result,
@@ -343,41 +361,43 @@ and understanding protein sequences and their conservation in 2D and 3D.
                         f"After filtering, **{len(high_score_seqs)}** sequences will be used for MSA."
                     )
                     if high_score_seqs:
-                        msa_infile = out_path("msa_in.fasta")
-                        msa_outfile = out_path("msa_out.fasta")
-                        clustalo_resolved = get_clustalo_path(clustalo_path)
+                        msa_infile = out_path("msa/msa_in.fasta")
+                        msa_outfile = out_path("msa/msa_out.fasta")
+
+                        # NEW: pyfamsa-based MSA call (no clustal path)
                         max_threads = min(os.cpu_count() or 4, 16)
-                        if clustalo_resolved:
-                            msa_outfile = perform_msa_and_fix_header(
-                                high_score_seqs,
-                                id_array_selected,
-                                st.session_state.reference_seq,
-                                msa_infile,
-                                msa_outfile,
-                                clustalo_resolved,
-                                max_threads,
-                            )
+                        msa_outfile = perform_msa_pyfamsa(
+                            high_score_seqs,
+                            id_array_selected,
+                            st.session_state.reference_seq,
+                            msa_infile,
+                            msa_outfile,
+                            threads=max_threads,
+                        )
+
                         if msa_outfile:
-                            msa_image, msa_letters = msa_to_image(
-                                msa_outfile.replace(".fasta", ".aln")
-                            )
+                            aln_file = msa_outfile.replace(".fasta", ".aln")
+                            if os.path.exists(aln_file):
+                                st.session_state.outputs.add(aln_file)
+
+                            msa_image, msa_letters = msa_to_image(aln_file)
                             st.session_state.msa_done = True
                             st.session_state.msa_image = msa_image
                             st.session_state.msa_letters = msa_letters
                             st.session_state.msa_outfile = msa_outfile
 
                             st.session_state.msa_df = analyze_alignment(
-                                msa_outfile.replace("fasta", "aln"),
+                                aln_file,
                                 st.session_state.reference_seq,
                             )
 
                             # Run al2co
                             al2co_resolved = get_al2co_path(al2co_path)
                             if al2co_resolved:
-                                al2co_output = out_path("al2co_output.txt")
+                                al2co_output = out_path("al2co/al2co_output.txt")
                                 ok = run_al2co(
                                     al2co_resolved,
-                                    msa_outfile.replace("fasta", "aln"),
+                                    aln_file,
                                     al2co_output,
                                 )
                                 if ok:
@@ -394,7 +414,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
                                 mutation_summary,
                                 all_mutations_str,
                             ) = list_unique_point_mutations(
-                                msa_outfile.replace("fasta", "aln"),
+                                aln_file,
                                 "reference_sequence",
                                 st.session_state.alignment_mapping,
                                 deletion_threshold=10,
@@ -409,25 +429,29 @@ and understanding protein sequences and their conservation in 2D and 3D.
                     st.error(f"An error occurred during filtering and MSA: {e}")
                     st.error(traceback.format_exc())
 
+    # -----------------------------------
     # Step 4: Display MSA & Conservation
+    # -----------------------------------
     if st.session_state.get("msa_done"):
         try:
             show_msa = st.checkbox("Show MSA", value=st.session_state.show_msa)
             st.session_state.show_msa = show_msa
             if show_msa:
+                # Save the figure under the session folder (handled inside)
                 plot_msa_image(
-                    st.session_state.msa_image, st.session_state.msa_letters, folder=session_dir
+                    st.session_state.msa_image, st.session_state.msa_letters,
+                    folder=str(session_dir / "msa")
                 )
         except Exception as e:
             st.error(f"An error occurred while plotting MSA image: {e}")
             st.error(traceback.format_exc())
 
         if st.session_state.get("al2co_output"):
-            st.header("Conservation Scoring with al2co.exe")
-            with st.expander("View al2co.exe Output"):
+            st.header("Conservation Scoring with al2co")
+            with st.expander("View al2co Output"):
                 try:
                     content = open(st.session_state.al2co_output, "r").read()
-                    st.text_area("al2co.exe Output", value=content, height=300)
+                    st.text_area("al2co Output", value=content, height=300)
                 except Exception as e:
                     st.error(f"Error reading al2co output: {e}")
                     st.error(traceback.format_exc())
@@ -439,11 +463,13 @@ and understanding protein sequences and their conservation in 2D and 3D.
                     ["Plotly", "Seaborn"],
                 )
                 if choice == "Seaborn":
-                    visualize_al2co_seaborn(st.session_state.al2co_df, session_dir)
+                    visualize_al2co_seaborn(st.session_state.al2co_df, str(session_dir / "al2co"))
                 else:
-                    visualize_al2co_plotly(st.session_state.al2co_df, session_dir)
+                    visualize_al2co_plotly(st.session_state.al2co_df, str(session_dir / "al2co"))
 
-    # Point Mutations Analysis with switchable histogram plots
+    # -----------------------------------
+    # Point Mutations Analysis
+    # -----------------------------------
     if st.session_state.get("unique_mutations"):
         st.header("Point Mutations Analysis")
 
@@ -471,12 +497,12 @@ and understanding protein sequences and their conservation in 2D and 3D.
         # Save CSVs
         muts_export = get_mutation_dataframe()
         if not muts_export.empty:
-            csv1 = out_path("point_mutations.csv")
+            csv1 = out_path("tables/point_mutations.tsv")
             muts_export.to_csv(csv1, index=False, sep="\t")
             st.success(f"Point mutations saved to `{csv1}`.")
         unique_muts_df = muts_export.drop_duplicates(subset=["Mutation"])
         if not unique_muts_df.empty:
-            csv2 = out_path("unique_point_mutations.csv")
+            csv2 = out_path("tables/unique_point_mutations.csv")
             unique_muts_df.to_csv(csv2, index=False)
             st.success(f"Unique point mutations saved to `{csv2}`.")
 
@@ -491,12 +517,11 @@ and understanding protein sequences and their conservation in 2D and 3D.
         if plot_type == "Mutation frequency histogram":
             # Compute mutation counts
             counts = muts_export["Mutation"].value_counts().reset_index()
-
             counts.columns = ["Mutation", "Count"]
-            
+
             # Show the mutation counts as a fraction of all sequences
             max_count = st.session_state.msa_image.shape[0]
-            counts['Count'] = counts['Count']/max_count*100
+            counts["Count"] = counts["Count"] / max_count * 100
             fig = px.bar(
                 counts,
                 x="Mutation",
@@ -526,7 +551,10 @@ and understanding protein sequences and their conservation in 2D and 3D.
         if st.session_state.get("phylogenetic_tree") is None:
             seq_count = len(st.session_state.result[0])
             if seq_count <= 200:
-                tree_file = generate_phylogenetic_tree(st.session_state.msa_outfile, folder=session_dir)
+                tree_file = generate_phylogenetic_tree(
+                    st.session_state.msa_outfile,
+                    folder=str(session_dir / "tree")
+                )
                 if tree_file:
                     st.session_state.phylogenetic_tree = tree_file
                     plot_phylogenetic_tree(tree_file, c2)
@@ -534,11 +562,13 @@ and understanding protein sequences and their conservation in 2D and 3D.
                     c2.warning("Phylogenetic tree could not be generated.")
             else:
                 c2.warning(
-                    f"Tree generation disabled for >200 sequences (current: {seq_count})."
+                    f"Automatic tree generation disabled for >200 sequences (current: {seq_count})."
                 )
-                if c2.checkbox("Generate tree with random 200 seq sample"):
+                if c2.checkbox("Generate tree (fast)"):
                     tree_file = generate_phylogenetic_tree(
-                        st.session_state.msa_outfile, use_random_subsample=True, folder=session_dir
+                        st.session_state.msa_outfile,
+                        use_random_subsample=False,
+                        folder=str(session_dir / "tree")
                     )
                     if tree_file:
                         st.session_state.phylogenetic_tree = tree_file
@@ -546,7 +576,9 @@ and understanding protein sequences and their conservation in 2D and 3D.
         else:
             plot_phylogenetic_tree(st.session_state.phylogenetic_tree, c2)
 
+    # -----------------------------------
     # Structural Mapping
+    # -----------------------------------
     st.header("Structural Mapping of the AL2CO Score")
     if st.session_state.get("msa_done") and st.session_state.get("al2co_output"):
         pdb_server = st.radio(
@@ -587,7 +619,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
         else:
             uploaded = st.file_uploader("Upload Your Own PDB File:", type=["pdb", "ent"])
             if uploaded:
-                pdb_file = out_path("uploaded_structure.pdb")
+                pdb_file = out_path("pdb/uploaded_structure.pdb")
                 with open(pdb_file, "wb") as f:
                     f.write(uploaded.getbuffer())
                 st.success("PDB file uploaded.")
@@ -609,6 +641,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
                         frequency_threshold=frequency_threshold,
                         own_pdb=pdb_file,
                         st_column=c11,
+                        save_dir=str(session_dir / "pdb"),
                     )
                 else:
                     result = process_pdb_chain(
@@ -618,7 +651,9 @@ and understanding protein sequences and their conservation in 2D and 3D.
                         frequency_threshold=frequency_threshold,
                         uniprot_id=uniprot_id,
                         st_column=c11,
+                        save_dir=str(session_dir / "pdb"),
                     )
+
             # Metadata
             md = result["metadata"]
             c1.write(f"**PDB ID:** {md['pdb_id']}")
@@ -707,31 +742,43 @@ and understanding protein sequences and their conservation in 2D and 3D.
             st.error(f"An error occurred during PDB processing: {e}")
             st.error(traceback.format_exc())
 
+    # -----------------------------------
     # Download Results
+    # -----------------------------------
     if st.session_state.get("msa_done"):
         st.header("Download Results")
-        summary_path = out_path(f"{clean_string_for_path(query)}.txt")
-        with open(summary_path, "w") as f:
-            f.write(f"Query: {query}\n")
-            f.write(f"Number of sequences fetched: {len(st.session_state.proteins_list)}\n")
-            f.write(f"Run at: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        summary_path = out_path(f"summary/{clean_string_for_path(query)}.txt")
+        try:
+            with open(summary_path, "w") as f:
+                f.write(f"Query: {query}\n")
+                f.write(f"Number of sequences fetched: {len(st.session_state.proteins_list)}\n")
+                f.write(f"Run at: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        except Exception as e:
+            st.warning(f"Could not write summary: {e}")
 
-        # Gather session files
-        all_files = glob.glob(str(session_dir / "*"))
-        all_files += glob.glob(str(session_dir / "*/*"))
-        zip_buffer = create_zip_file(all_files, "analysis_files.zip")
+        # Gather session files recursively
+        all_files = [str(p) for p in Path(session_dir).rglob("*") if p.is_file()]
+        # Include anything tracked explicitly
+        all_files = sorted(set(all_files).union(st.session_state.outputs))
+        
+        # file name
+        filename = f"analysis_{clean_string_for_path(query)}.zip"
+
+        zip_buffer = create_zip_file(all_files, filename)
         if zip_buffer:
             st.download_button(
                 label="Download All Results as Zip",
                 data=zip_buffer,
-                file_name="analysis_files.zip",
+                file_name=filename,
                 mime="application/zip",
                 key="download_zip",
             )
         else:
             st.info("No files available for download.")
 
-    # Rerun Alignment
+    # -----------------------------------
+    # Rerun Alignment & Session Utilities
+    # -----------------------------------
     st.sidebar.header("Rerun Pairwise Alignment")
     if st.sidebar.button("Redo Alignment"):
         for key in [
@@ -752,6 +799,16 @@ and understanding protein sequences and their conservation in 2D and 3D.
                 st.session_state[key] = None
         st.success("Alignment reset.")
         st.rerun()
+
+    with st.sidebar.expander("Session utilities"):
+        c1, c2 = st.columns(2)
+        if c1.button("Clear this session state"):
+            st.session_state.clear()
+            st.rerun()
+        if c2.button("Delete session folder on disk"):
+            import shutil
+            shutil.rmtree(session_dir, ignore_errors=True)
+            st.success("Session folder deleted. You may refresh the app.")
 
     st.sidebar.markdown(
         """

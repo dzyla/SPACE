@@ -7,3 +7,5 @@
 *.csv
 *.txt
 space/__pycache__/*
+sessions/*
+*safeBackup*
