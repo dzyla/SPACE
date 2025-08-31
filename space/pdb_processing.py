@@ -274,7 +274,16 @@ def process_pdb_chain(
 
         else:
             # RCSB Search v2 REST (sequence)
-            hits = _rcsb_sequence_search(seq, identity_cutoff=sequence_score)
+            if sequence_score is None:
+                st.warning("No sequence identity threshold provided. Using default value 0.9.")
+                identity_cutoff = 0.9
+            else:
+                identity_cutoff = sequence_score
+            try:
+                hits = _rcsb_sequence_search(seq, identity_cutoff=identity_cutoff)
+            except Exception as e:
+                st.error(f"An error occurred during PDB processing: {e}")
+                raise
             if not hits:
                 raise ValueError(
                     "No PDB entries found at the chosen identity threshold. Try AlphaFold instead."
@@ -342,14 +351,24 @@ def process_pdb_chain(
         default_score = max_al2co
 
     chain_data: Dict[str, Dict] = {}
+    chain_original_starting_position: Dict[str, int] = {}
+
+
     for chain, score in chain_scores.items():
         aln = next(iter(aligner.align(seq, chain_sequences[chain])), None)
-        residue_map: Dict[int, int] = {}
+        residue_map: Dict[int, int] = {}  # Maps reference seq pos (1-based) -> chain seq pos (1-based)
+        ref_to_pdb_resnum: Dict[int, int] = {}  # Maps reference seq pos (1-based) -> PDB residue_number
 
         if aln is not None:
             aligned = getattr(aln, "aligned", None)
-            # 'aligned' is a pair of numpy arrays with shape (n, 2):
-            # aligned[0] -> reference blocks, aligned[1] -> target blocks
+            # Get the residue numbers for the chain in order
+            chain_atoms = atom_df[atom_df["chain_id"] == chain].copy()
+            chain_atoms = chain_atoms.sort_values(by=["residue_number", "insertion"])
+            pdb_residue_numbers = chain_atoms["residue_number"].unique()
+            # Build chain seq pos (1-based) -> PDB residue_number mapping
+            chainseqpos_to_resnum = {i+1: resnum for i, resnum in enumerate(pdb_residue_numbers)}
+
+            # Now build reference seq pos -> PDB residue_number mapping via alignment
             if (
                 aligned is not None
                 and len(aligned) >= 2
@@ -358,7 +377,10 @@ def process_pdb_chain(
             ):
                 for (ref_s, ref_e), (tar_s, tar_e) in zip(aligned[0], aligned[1]):
                     for ref_idx, tgt_idx in zip(range(ref_s, ref_e), range(tar_s, tar_e)):
-                        residue_map[ref_idx + 1] = tgt_idx + 1  # 1-based indexing
+                        residue_map[ref_idx + 1] = tgt_idx + 1  # 1-based
+                        pdb_resnum = chainseqpos_to_resnum.get(tgt_idx + 1)
+                        if pdb_resnum is not None:
+                            ref_to_pdb_resnum[ref_idx + 1] = pdb_resnum
 
         resi_scores: Dict[int, float] = {}
         for _, row in al2co_score.dropna(subset=["Location"]).iterrows():
@@ -366,36 +388,40 @@ def process_pdb_chain(
                 loc = int(row["Location"])
             except Exception:
                 continue
-            tgt = residue_map.get(loc)
-            if tgt is not None:
+            pdb_resnum = ref_to_pdb_resnum.get(loc)
+            if pdb_resnum is not None:
                 try:
-                    resi_scores[tgt] = float(row["al2co_score"])
+                    resi_scores[pdb_resnum] = float(row["al2co_score"])
                 except Exception:
-                    resi_scores[tgt] = default_score
+                    resi_scores[pdb_resnum] = default_score
 
-        # Update B-factors for this chain
-        chain_atoms = atom_df[atom_df["chain_id"] == chain].copy()
+        # Update B-factors for this chain using PDB residue numbers
         for res_no in chain_atoms["residue_number"].unique():
             chain_atoms.loc[chain_atoms["residue_number"] == res_no, "b_factor"] = resi_scores.get(
                 res_no, default_score
             )
 
-        # Compose new PandasPdb subset (preserve HETATM for the chain)
+        # Compose new PandasPdb subset (remove HETATM)
         selected_ppdb = PandasPdb()
         selected_ppdb.df["ATOM"] = chain_atoms
         if "HETATM" in ppdb.df:
-            het = ppdb.df["HETATM"]
-            if het is not None and not het.empty:
-                selected_ppdb.df["HETATM"] = het[het["chain_id"] == chain]
+            # het = ppdb.df["HETATM"]
+            # if het is not None and not het.empty:
+            #     selected_ppdb.df["HETATM"] = het[het["chain_id"] == chain]
+            pass
 
         out_pdb = os.path.join(out_dir, f"selected_al2co_labeled_chain_{chain}.pdb")
-        selected_ppdb.to_pdb(path=out_pdb, records=["ATOM", "HETATM"], gz=False)
+        selected_ppdb.to_pdb(path=out_pdb, records=["ATOM"], gz=False)
+
+        # For compatibility, keep residue_offset as before (first reference seq pos mapped)
+        chain_original_starting_position = list(residue_map.keys())[0] if residue_map else None
 
         chain_data[chain] = {
             "alignment_score": score,
             "alignment": chain_align_text.get(chain, ""),
             "residue_score_map": resi_scores,
             "updated_pdb_path": out_pdb,
+            "residue_offset": chain_original_starting_position
         }
 
     return {
