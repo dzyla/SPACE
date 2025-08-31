@@ -720,7 +720,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
             c3, c4 = c2.columns(2)
             annotate = c3.checkbox("Show Annotation")
             style = c4.radio("Select Style", ["Stick", "Sphere", "Cartoon"]).lower()
-            print(chain_offset)
+
             for res_num, score in annotation_residues:
                 idx = int(res_num)
                 col = grad_dict.get(score, "#deddda")
