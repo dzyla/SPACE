@@ -171,23 +171,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
             step=1,
         )
 
-        # Only AL2CO executable is needed; MSA uses pyfamsa (pure Python)
-        system = platform.system()
-        if system == "Windows":
-            al2co_default = "al2co"
-        else:
-            al2co_default = "./exceculatbles/amd64/al2co"
-            try:
-                if os.path.exists(al2co_default):
-                    os.chmod(al2co_default, 0o777)
-            except Exception:
-                pass
 
-        al2co_path = st.text_input(
-            "Enter the path to al2co executable:",
-            value=al2co_default,
-            help="Provide the path if al2co is not in your system PATH.",
-        )
 
         submit_button = st.form_submit_button(label="Fetch Sequences")
 
@@ -392,19 +376,8 @@ and understanding protein sequences and their conservation in 2D and 3D.
                             )
 
                             # Run al2co
-                            al2co_resolved = get_al2co_path(al2co_path)
-                            if al2co_resolved:
-                                al2co_output = out_path("al2co/al2co_output.txt")
-                                ok = run_al2co(
-                                    al2co_resolved,
-                                    aln_file,
-                                    al2co_output,
-                                )
-                                if ok:
-                                    st.session_state.al2co_output = al2co_output
-                                    st.session_state.al2co_df = parse_al2co_output(
-                                        al2co_output
-                                    )
+                            st.session_state.al2co_df = run_al2co(aln_file)
+                            st.session_state.al2co_output = "computed"
 
                             # Identify point mutations
                             (
@@ -446,26 +419,17 @@ and understanding protein sequences and their conservation in 2D and 3D.
             st.error(f"An error occurred while plotting MSA image: {e}")
             st.error(traceback.format_exc())
 
-        if st.session_state.get("al2co_output"):
+        if st.session_state.get("al2co_df") is not None:
             st.header("Conservation Scoring with al2co")
-            with st.expander("View al2co Output"):
-                try:
-                    content = open(st.session_state.al2co_output, "r").read()
-                    st.text_area("al2co Output", value=content, height=300)
-                except Exception as e:
-                    st.error(f"Error reading al2co output: {e}")
-                    st.error(traceback.format_exc())
-
-            if st.session_state.get("al2co_df") is not None:
-                st.subheader("Conservation Scores from al2co")
-                choice = st.selectbox(
-                    "Select plot type for al2co conservation scores:",
-                    ["Plotly", "Seaborn"],
-                )
-                if choice == "Seaborn":
-                    visualize_al2co_seaborn(st.session_state.al2co_df, str(session_dir / "al2co"))
-                else:
-                    visualize_al2co_plotly(st.session_state.al2co_df, str(session_dir / "al2co"))
+            st.subheader("Conservation Scores from al2co")
+            choice = st.selectbox(
+                "Select plot type for al2co conservation scores:",
+                ["Plotly", "Seaborn"],
+            )
+            if choice == "Seaborn":
+                visualize_al2co_seaborn(st.session_state.al2co_df, str(session_dir / "al2co"))
+            else:
+                visualize_al2co_plotly(st.session_state.al2co_df, str(session_dir / "al2co"))
 
     # -----------------------------------
     # Point Mutations Analysis
@@ -586,14 +550,18 @@ and understanding protein sequences and their conservation in 2D and 3D.
             ["PDB", "AlphaFold", "Upload Your Own PDB"],
             horizontal=True,
         )
-        sequence_score = None
+        sequence_score = 0.9
         uniprot_id = None
         uploaded = None
 
+        frequency_threshold = st.slider(
+            "Mutation Frequency Threshold for Annotation", 
+            0.0, 1.0, 0.1, 0.01,
+            help="Adjust to filter displayed mutation annotations based on their frequency."
+        )
+
         if pdb_server == "PDB":
-            sequence_score = st.slider(
-                "Sequence Identity Score for PDB search", 0.0, 1.0, 0.9, 0.01
-            )
+            pass
         elif pdb_server == "AlphaFold":
             sequence_score = 1.0
             uniprot_ids = extract_uniprot_ids(
@@ -628,7 +596,6 @@ and understanding protein sequences and their conservation in 2D and 3D.
                 st.warning("Please upload a PDB file.")
                 uniprot_id = None
 
-        frequency_threshold = 0.1
 
         try:
             c1, c2 = st.columns([1, 2])
@@ -662,82 +629,108 @@ and understanding protein sequences and their conservation in 2D and 3D.
             c1.write(f"**Deposition date:** {md['date']}")
 
             chain_ids = list(result["chain_data"].keys())
-            specify = c12.checkbox("Specify a different chain")
-            if specify:
-                selected_chain = c12.selectbox("Select chain", chain_ids)
-                score = result["chain_data"][selected_chain]["alignment_score"]
-                c1.write(f"Chain `{selected_chain}` (Score: {score})")
+            
+            # Find the best chain
+            best_chain = max(
+                chain_ids,
+                key=lambda x: result["chain_data"][x]["alignment_score"],
+            )
+            
+            with c12.form("chain_selection_form"):
+                selected_chains = st.multiselect(
+                    "Select chains to display",
+                    options=chain_ids,
+                    default=[best_chain]
+                )
+                submit_chains = st.form_submit_button("Update Visualization")
+            
+            if submit_chains:
+                pass # The re-run will capture the new selected_chains
+            
+            if not selected_chains:
+                st.warning("Please select at least one chain to visualize.")
             else:
-                selected_chain = max(
-                    chain_ids,
-                    key=lambda x: result["chain_data"][x]["alignment_score"],
-                )
-                score = result["chain_data"][selected_chain]["alignment_score"]
-                c1.write(f"Best chain `{selected_chain}` (Score: {score})")
-            if score < len(st.session_state.reference_seq) * 0.2:
-                c1.warning("Low alignment score; consider another chain.")
+                for chain in selected_chains:
+                    score = result["chain_data"][chain]["alignment_score"]
+                    matched_len = result["chain_data"][chain]["matched_length"]
+                    c1.write(f"Chain `{chain}` (Score: {score})")
+                    
+                    # We compare score to matched_len instead of total reference length 
+                    # to prevent penalizing perfect subset fragment alignments.
+                    if matched_len > 0 and score < matched_len * 0.2:
+                        c1.warning(f"Low alignment score for chain {chain}; consider another chain.")
 
-            chain_data = result["chain_data"][selected_chain]
-            c1.subheader("Pairwise Sequence Alignment")
-            with c1.expander("Show Alignment Details"):
-                st.code(chain_data["alignment"])
+                # We show the alignment details only for the primary (first selected) chain
+                primary_chain = selected_chains[0]
+                primary_chain_data = result["chain_data"][primary_chain]
+                c1.subheader(f"Pairwise Sequence Alignment ({primary_chain})")
+                with c1.expander("Show Alignment Details"):
+                    st.code(primary_chain_data["alignment"])
 
-            # 3D visualization
-            c2.write("### Selected Chain Visualization")
-            xyzview = py3Dmol.view()
-            pdb_str = open(chain_data["updated_pdb_path"], "r").read()
-            chain_offset = chain_data['residue_offset']
-            xyzview.addModel(pdb_str, "pdb")
+                # 3D visualization
+                c2.write("### Selected Chain Visualization")
+                xyzview = py3Dmol.view()
+                
+                c3, c4 = c2.columns(2)
+                annotate = c3.checkbox("Show Annotation")
+                style = c4.radio("Select Style", ["Stick", "Sphere", "Cartoon"]).lower()
 
-            color_list = ["#ff2600", "#ffc04d", "#deddda"]
-            scores = sorted(set(chain_data["residue_score_map"].values()))
-            num_colors = len(scores)
-            counter = Counter(chain_data["residue_score_map"].values())
-            max_freq = max(counter.values())
-            less_freq = [
-                val for val, cnt in counter.items()
-                if cnt < frequency_threshold * max_freq and val != max(scores)
-            ]
-            annotation_residues = [
-                (k, v) for k, v in chain_data["residue_score_map"].items()
-                if v in less_freq
-            ]
-            gradient = generate_custom_gradient(color_list, num_colors)
-            grad_dict = dict(zip(scores, gradient))
+                color_list = ["#ff2600", "#ffc04d", "#deddda"]
 
-            xyzview.setStyle({
-                "cartoon": {
-                    "colorscheme": {
-                        "prop": "b",
-                        "gradient": "linear",
-                        "colors": color_list,
-                        "min": min(scores),
-                        "max": max(scores),
-                    }
-                }
-            })
+                for i, chain in enumerate(selected_chains):
+                    chain_data = result["chain_data"][chain]
+                    pdb_str = open(chain_data["updated_pdb_path"], "r").read()
+                    
+                    # Add model for each chain, keep track of the model instance index
+                    xyzview.addModel(pdb_str, "pdb")
+                    
+                    scores = sorted(set(chain_data["residue_score_map"].values()))
+                    if not scores:
+                        continue
+                        
+                    num_colors = len(scores)
+                    counter = Counter(chain_data["residue_score_map"].values())
+                    max_freq = max(counter.values())
+                    less_freq = [
+                        val for val, cnt in counter.items()
+                        if cnt < frequency_threshold * max_freq and val != max(scores)
+                    ]
+                    annotation_residues = [
+                        (k, v) for k, v in chain_data["residue_score_map"].items()
+                        if v in less_freq
+                    ]
+                    gradient = generate_custom_gradient(color_list, num_colors)
+                    grad_dict = dict(zip(scores, gradient))
 
-            c3, c4 = c2.columns(2)
-            annotate = c3.checkbox("Show Annotation")
-            style = c4.radio("Select Style", ["Stick", "Sphere", "Cartoon"]).lower()
+                    xyzview.setStyle({'model': i}, {
+                        "cartoon": {
+                            "colorscheme": {
+                                "prop": "b",
+                                "gradient": "linear",
+                                "colors": color_list,
+                                "min": min(scores),
+                                "max": max(scores),
+                            }
+                        }
+                    })
 
-            for res_num, score in annotation_residues:
-                idx = int(res_num)
-                col = grad_dict.get(score, "#deddda")
-                if annotate:
-                    xyzview.addLabel(
-                        str(idx),
-                        {"fontOpacity": 1, "fontColor": "black", "backgroundColor": col},
-                        {"resi": idx},
-                    )
-                xyzview.addStyle(
-                    {"chain": selected_chain, "resi": idx},
-                    {style: {"color": col}},
-                )
+                    for res_num, score in annotation_residues:
+                        idx = int(res_num)
+                        col = grad_dict.get(score, "#deddda")
+                        if annotate:
+                            xyzview.addLabel(
+                                str(idx),
+                                {"fontOpacity": 1, "fontColor": "black", "backgroundColor": col},
+                                {"model": i, "resi": idx},
+                            )
+                        xyzview.addStyle(
+                            {"model": i, "resi": idx},
+                            {style: {"color": col}},
+                        )
 
-            xyzview.zoomTo()
-            with c2:
-                showmol(xyzview, width=1000, height=500)
+                xyzview.zoomTo()
+                with c2:
+                    showmol(xyzview, width=1000, height=500)
 
         except Exception as e:
             st.error(f"An error occurred during PDB processing: {e}")

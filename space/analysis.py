@@ -13,82 +13,45 @@ from .utils import clean_fasta
 from Bio import AlignIO, Align, SeqIO
 import plotly.express as px
 
-def run_al2co(al2co_path: str, alignment_file: str, al2co_output: str) -> Optional[str]:
-    try:
-        cmd = [al2co_path, "-i", alignment_file, "-o", al2co_output]
-        with st.spinner(f"Running al2co.exe: {' '.join(cmd)}"):
-            process = subprocess.run(
-                cmd,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            st.text(process.stdout)
-            return al2co_output
-    except subprocess.CalledProcessError as e:
-        st.error(f"An error occurred while running al2co.exe: {e.stderr}")
-        raise e
-    except FileNotFoundError:
-        st.error("al2co.exe not found. Please ensure the path is correct.")
-        raise FileNotFoundError("al2co.exe not found.")
-    except Exception as e:
-        st.error(f"An unexpected error occurred while running al2co.exe: {e}")
-        raise e
+import al2co
 
-def parse_al2co_output(al2co_file: str) -> pd.DataFrame:
+def run_al2co(alignment_file: str) -> pd.DataFrame:
     if "alignment_mapping" not in st.session_state:
         st.error("Alignment mapping not found. Cannot map al2co locations.")
         raise ValueError("Alignment mapping not found in session state.")
 
     alignment_mapping = st.session_state.alignment_mapping
 
-    data = []
-    skipped_lines = 0
     try:
-        with open(al2co_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or not line[0].isdigit():
-                    skipped_lines += 1
-                    continue
-                parts = line.split()
-                if len(parts) < 3:
-                    skipped_lines += 1
-                    continue
-                location, residue, score = parts[:3]
-                try:
-                    location = int(location)
-                    if location < 1 or location > len(alignment_mapping):
-                        raise ValueError("Location out of alignment range")
-                    mapped_residue_num = alignment_mapping[location - 1]
-                    mapped_location = (
-                        mapped_residue_num if mapped_residue_num else np.nan
-                    )
-                    score = float(score)
-                    data.append(
-                        {
-                            "Location": mapped_location,
-                            "Residue": residue,
-                            "al2co_score": score,
-                        }
-                    )
-                except ValueError:
-                    skipped_lines += 1
-                    continue
+        alignment = AlignIO.read(alignment_file, "clustal")
+        with st.spinner("Running al2co..."):
+            scores = al2co.run_al2co(alignment)
+
+        data = []
+        for pos, score in scores.items():
+            if pos < 1 or pos > len(alignment_mapping):
+                continue
+            
+            mapped_residue_num = alignment_mapping[pos - 1]
+            mapped_location = mapped_residue_num if mapped_residue_num else np.nan
+            residue = alignment[0, pos - 1] 
+
+            data.append(
+                {
+                    "Location": mapped_location,
+                    "Residue": residue,
+                    "al2co_score": float(score),
+                }
+            )
+
         if data:
             df = pd.DataFrame(data)
-            if skipped_lines > 0:
-                print(f"Skipped {skipped_lines} lines due to unexpected format.")
             return df
         else:
-            st.error("No valid data found in al2co.exe output.")
-            raise ValueError("No valid data in al2co.exe output.")
-    except FileNotFoundError:
-        st.error(f"The file {al2co_file} was not found.")
-        raise FileNotFoundError(f"The file {al2co_file} does not exist.")
+            st.error("No valid data found in al2co output.")
+            raise ValueError("No valid data in al2co output.")
     except Exception as e:
-        st.error(f"An error occurred while parsing al2co.exe output: {e}")
+        st.error(f"An error occurred while running al2co: {e}")
         raise e
 
 def list_unique_point_mutations(

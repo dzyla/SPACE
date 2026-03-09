@@ -418,6 +418,7 @@ def process_pdb_chain(
 
         chain_data[chain] = {
             "alignment_score": score,
+            "matched_length": len(residue_map),
             "alignment": chain_align_text.get(chain, ""),
             "residue_score_map": resi_scores,
             "updated_pdb_path": out_pdb,

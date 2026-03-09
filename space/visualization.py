@@ -63,6 +63,10 @@ def visualize_al2co_seaborn(al2co_df: pd.DataFrame, folder: str = None):
     cbar = fig.colorbar(scatter, ax=ax)
     cbar.set_label("Conservation Score")
 
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        fig.savefig(os.path.join(folder, "al2co_plot.png"))
+
     st.pyplot(fig)
 
 def visualize_al2co_plotly(al2co_df: pd.DataFrame, folder: str = None):
@@ -138,7 +142,10 @@ def visualize_al2co_plotly(al2co_df: pd.DataFrame, folder: str = None):
         hovermode="closest",
         height=600,
     )
-    fig.write_html(os.path.join(folder, "al2co_plot.html"))
+    # Make sure the directory exists
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        fig.write_html(os.path.join(folder, "al2co_plot.html"))
 
     st.plotly_chart(fig, use_container_width=True)
 

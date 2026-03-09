@@ -29,8 +29,6 @@ def get_executable_path(executable_name: str, default_path: str) -> str:
 def get_clustalo_path(default_path: str) -> str:
     return get_executable_path("clustalo", default_path)
 
-def get_al2co_path(default_path: str) -> str:
-    return get_executable_path("al2co", default_path)
 
 def clean_fasta(fasta_str: str) -> str:
     if not fasta_str:
