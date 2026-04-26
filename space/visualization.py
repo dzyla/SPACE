@@ -530,3 +530,127 @@ def generate_custom_gradient(color_list: list, number_of_colors: int) -> list:
         gradient.extend(segment_colors)
 
     return gradient
+
+def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identity_threshold: float, folder: str = None):
+    """
+    Generates and visualizes a sequence logo and consensus sequence from an MSA file.
+    Only positions present in the reference sequence are considered (using alignment_mapping).
+    If the identity of the most frequent amino acid at a position is below identity_threshold,
+    the position is set to 'X' with a distribution of 1.0.
+
+    Args:
+        msa_file (str): Path to the FASTA MSA file.
+        alignment_mapping (list): Mapping of alignment columns to reference sequence positions.
+        identity_threshold (float): Required identity fraction to keep the true logo, otherwise 'X'.
+        folder (str): Directory to save the output HTML plot.
+    """
+    if not msa_file or not os.path.exists(msa_file):
+        st.error("MSA file not found.")
+        return
+
+    try:
+        alignment = AlignIO.read(msa_file, "fasta")
+    except Exception as e:
+        st.error(f"Error reading MSA file: {e}")
+        return
+
+    aln_len = alignment.get_alignment_length()
+
+    # Read the alignment into a NumPy array for speed
+    arr = np.array([list(str(rec.seq)) for rec in alignment], dtype="U1")
+
+    # Initialize variables for the logo and consensus
+    logo_data = []
+    consensus_seq = []
+    positions = []
+
+    for i in range(aln_len):
+        mapped_ref = alignment_mapping[i]
+        if mapped_ref is None:
+            continue
+
+        col = arr[:, i]
+        total_seqs = len(col)
+        counts = Counter(col)
+
+        # Calculate non-gap counts
+        non_gap_counts = {k: v for k, v in counts.items() if k != '-'}
+
+        if not non_gap_counts:
+            # All gaps, rare but possible
+            logo_data.append({'Position': mapped_ref, 'X': 1.0})
+            consensus_seq.append('X')
+            positions.append(mapped_ref)
+            continue
+
+        most_common_aa, most_common_count = Counter(non_gap_counts).most_common(1)[0]
+        identity = most_common_count / total_seqs
+
+        dist = {}
+        if identity >= identity_threshold:
+            for aa, count in non_gap_counts.items():
+                dist[aa] = count / total_seqs
+            consensus_seq.append(most_common_aa)
+        else:
+            dist['X'] = 1.0
+            consensus_seq.append('X')
+
+        logo_data.append({'Position': mapped_ref, **dist})
+        positions.append(mapped_ref)
+
+    # If no data could be extracted
+    if not logo_data:
+        st.warning("No data extracted for the Sequence Logo.")
+        return
+
+    # Extract all amino acids present in the distribution
+    all_aas = set()
+    for d in logo_data:
+        all_aas.update([k for k in d.keys() if k != 'Position'])
+
+    # Set up colors for Amino Acids
+    color_palette = px.colors.qualitative.Alphabet
+    aa_colors = {}
+    for idx, aa in enumerate(sorted(list(all_aas))):
+        aa_colors[aa] = color_palette[idx % len(color_palette)]
+
+    fig = go.Figure()
+
+    for aa in sorted(list(all_aas)):
+        y = []
+        text = []
+        for d in logo_data:
+            val = d.get(aa, 0)
+            y.append(val)
+            text.append(aa if val > 0 else "")
+
+        fig.add_trace(go.Bar(
+            x=positions,
+            y=y,
+            name=aa,
+            text=text,
+            textposition='inside',
+            insidetextanchor='middle',
+            marker_color=aa_colors[aa],
+            marker_line_width=0,
+            hoverinfo='x+y+name'
+        ))
+
+    fig.update_layout(
+        barmode='stack',
+        title="Sequence Logo",
+        xaxis_title="Residue Position",
+        yaxis_title="Frequency",
+        plot_bgcolor='white',
+        height=400
+    )
+
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        fig.write_html(os.path.join(folder, "sequence_logo.html"))
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write("**Consensus Sequence:**")
+    consensus_str = "".join(consensus_seq)
+    st.code(consensus_str, language="text")

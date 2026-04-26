@@ -20,7 +20,7 @@ import stmol
 import streamlit as st
 from stmol import showmol
 
-from space.alignment import *          
+from space.alignment import *
 from space.analysis import *
 from space.fetch import *
 from space.pdb_processing import *
@@ -431,6 +431,20 @@ and understanding protein sequences and their conservation in 2D and 3D.
             else:
                 visualize_al2co_plotly(st.session_state.al2co_df, str(session_dir / "al2co"))
 
+            st.subheader("Sequence Logo and Consensus")
+            identity_threshold = st.slider(
+                "Identity Threshold (%) for Logo & Consensus",
+                min_value=0, max_value=100, value=60, step=5
+            )
+
+            if st.session_state.get("msa_outfile") and st.session_state.get("alignment_mapping"):
+                visualize_logo_and_consensus(
+                    st.session_state.msa_outfile,
+                    st.session_state.alignment_mapping,
+                    identity_threshold / 100.0,
+                    str(session_dir / "al2co")
+                )
+
     # -----------------------------------
     # Point Mutations Analysis
     # -----------------------------------
@@ -555,7 +569,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
         uploaded = None
 
         frequency_threshold = st.slider(
-            "Mutation Frequency Threshold for Annotation", 
+            "Mutation Frequency Threshold for Annotation",
             0.0, 1.0, 0.1, 0.01,
             help="Adjust to filter displayed mutation annotations based on their frequency."
         )
@@ -629,13 +643,13 @@ and understanding protein sequences and their conservation in 2D and 3D.
             c1.write(f"**Deposition date:** {md['date']}")
 
             chain_ids = list(result["chain_data"].keys())
-            
+
             # Find the best chain
             best_chain = max(
                 chain_ids,
                 key=lambda x: result["chain_data"][x]["alignment_score"],
             )
-            
+
             with c12.form("chain_selection_form"):
                 selected_chains = st.multiselect(
                     "Select chains to display",
@@ -643,10 +657,10 @@ and understanding protein sequences and their conservation in 2D and 3D.
                     default=[best_chain]
                 )
                 submit_chains = st.form_submit_button("Update Visualization")
-            
+
             if submit_chains:
                 pass # The re-run will capture the new selected_chains
-            
+
             if not selected_chains:
                 st.warning("Please select at least one chain to visualize.")
             else:
@@ -654,8 +668,8 @@ and understanding protein sequences and their conservation in 2D and 3D.
                     score = result["chain_data"][chain]["alignment_score"]
                     matched_len = result["chain_data"][chain]["matched_length"]
                     c1.write(f"Chain `{chain}` (Score: {score})")
-                    
-                    # We compare score to matched_len instead of total reference length 
+
+                    # We compare score to matched_len instead of total reference length
                     # to prevent penalizing perfect subset fragment alignments.
                     if matched_len > 0 and score < matched_len * 0.2:
                         c1.warning(f"Low alignment score for chain {chain}; consider another chain.")
@@ -670,7 +684,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
                 # 3D visualization
                 c2.write("### Selected Chain Visualization")
                 xyzview = py3Dmol.view()
-                
+
                 c3, c4 = c2.columns(2)
                 annotate = c3.checkbox("Show Annotation")
                 style = c4.radio("Select Style", ["Stick", "Sphere", "Cartoon"]).lower()
@@ -680,14 +694,14 @@ and understanding protein sequences and their conservation in 2D and 3D.
                 for i, chain in enumerate(selected_chains):
                     chain_data = result["chain_data"][chain]
                     pdb_str = open(chain_data["updated_pdb_path"], "r").read()
-                    
+
                     # Add model for each chain, keep track of the model instance index
                     xyzview.addModel(pdb_str, "pdb")
-                    
+
                     scores = sorted(set(chain_data["residue_score_map"].values()))
                     if not scores:
                         continue
-                        
+
                     num_colors = len(scores)
                     counter = Counter(chain_data["residue_score_map"].values())
                     max_freq = max(counter.values())
@@ -754,7 +768,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
         all_files = [str(p) for p in Path(session_dir).rglob("*") if p.is_file()]
         # Include anything tracked explicitly
         all_files = sorted(set(all_files).union(st.session_state.outputs))
-        
+
         # file name
         filename = f"analysis_{clean_string_for_path(query)}.zip"
 
@@ -806,7 +820,7 @@ and understanding protein sequences and their conservation in 2D and 3D.
 
     st.sidebar.markdown(
         """
-Developed by [Dawid Zyla](mailto:dzyla@lji.org)  
+Developed by [Dawid Zyla](mailto:dzyla@lji.org)
 Source code: [GitHub](https://github.com/dzyla/SPACE)
 """
     )
