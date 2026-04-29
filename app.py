@@ -433,8 +433,9 @@ and understanding protein sequences and their conservation in 2D and 3D.
 
             st.subheader("Sequence Logo and Consensus")
             identity_threshold = st.slider(
-                "Identity Threshold (%) for Logo & Consensus",
+                "Consensus Identity Threshold (%)",
                 min_value=0.0, max_value=100.0, value=60.0, step=0.5,
+                help="Positions where the most frequent amino acid falls below this threshold will be shown as 'X' in the consensus sequence."
             )
 
             if st.session_state.get("msa_outfile") and st.session_state.get("alignment_mapping"):

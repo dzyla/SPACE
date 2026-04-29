@@ -16,6 +16,7 @@ import streamlit as st
 from typing import List, Optional
 import py3Dmol
 from stmol import showmol
+import logomaker
 
 def visualize_al2co_seaborn(al2co_df: pd.DataFrame, folder: str = None):
     """
@@ -536,12 +537,12 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
     Generates and visualizes a sequence logo and consensus sequence from an MSA file.
     Only positions present in the reference sequence are considered (using alignment_mapping).
     If the identity of the most frequent amino acid at a position is below identity_threshold,
-    the position is set to 'X' with a distribution of 1.0.
+    the position is set to 'X' in the consensus sequence.
 
     Args:
         msa_file (str): Path to the FASTA MSA file.
         alignment_mapping (list): Mapping of alignment columns to reference sequence positions.
-        identity_threshold (float): Required identity fraction to keep the true logo, otherwise 'X'.
+        identity_threshold (float): Required identity fraction to keep the true amino acid, otherwise 'X'.
         folder (str): Directory to save the output HTML plot.
     """
     if not msa_file or not os.path.exists(msa_file):
@@ -574,28 +575,24 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
         counts = Counter(col)
 
         # Calculate non-gap counts
-        non_gap_counts = {k: v for k, v in counts.items() if k != '-'}
+        non_gap_counts = {k.upper(): v for k, v in counts.items() if k != '-'}
 
         if not non_gap_counts:
             # All gaps, rare but possible
-            logo_data.append({'Position': mapped_ref, 'X': 1.0})
-            consensus_seq.append('X')
+            consensus_seq.append('-')
             positions.append(mapped_ref)
+            logo_data.append({})
             continue
 
         most_common_aa, most_common_count = Counter(non_gap_counts).most_common(1)[0]
         identity = most_common_count / total_seqs
-
-        dist = {}
+        
         if identity >= identity_threshold:
-            for aa, count in non_gap_counts.items():
-                dist[aa] = count / total_seqs
             consensus_seq.append(most_common_aa)
         else:
-            dist['X'] = 1.0
             consensus_seq.append('X')
-
-        logo_data.append({'Position': mapped_ref, **dist})
+        
+        logo_data.append(non_gap_counts)
         positions.append(mapped_ref)
 
     # If no data could be extracted
@@ -603,53 +600,28 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
         st.warning("No data extracted for the Sequence Logo.")
         return
 
-    # Extract all amino acids present in the distribution
-    all_aas = set()
-    for d in logo_data:
-        all_aas.update([k for k in d.keys() if k != 'Position'])
+    counts_df = pd.DataFrame(logo_data, index=positions).fillna(0)
 
-    # Set up colors for Amino Acids
-    color_palette = px.colors.qualitative.Alphabet
-    aa_colors = {}
-    for idx, aa in enumerate(sorted(list(all_aas))):
-        aa_colors[aa] = color_palette[idx % len(color_palette)]
+    try:
+        # Transform counts to information content (bits)
+        info_df = logomaker.transform_matrix(counts_df, from_type='counts', to_type='information')
+        
+        fig, ax = plt.subplots(figsize=(12, 4))
+        logo = logomaker.Logo(info_df, ax=ax, color_scheme='chemistry')
+        logo.style_spines(visible=False)
+        logo.style_spines(spines=['left', 'bottom'], visible=True)
+        ax.set_title("Sequence Logo")
+        ax.set_xlabel("Residue Position")
+        ax.set_ylabel("Information (bits)")
+        plt.tight_layout()
 
-    fig = go.Figure()
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+            fig.savefig(os.path.join(folder, "sequence_logo.png"), dpi=300)
 
-    for aa in sorted(list(all_aas)):
-        y = []
-        text = []
-        for d in logo_data:
-            val = d.get(aa, 0)
-            y.append(val)
-            text.append(aa if val > 0 else "")
-
-        fig.add_trace(go.Bar(
-            x=positions,
-            y=y,
-            name=aa,
-            text=text,
-            textposition='inside',
-            insidetextanchor='middle',
-            marker_color=aa_colors[aa],
-            marker_line_width=0,
-            hoverinfo='x+y+name'
-        ))
-
-    fig.update_layout(
-        barmode='stack',
-        title="Sequence Logo",
-        xaxis_title="Residue Position",
-        yaxis_title="Frequency",
-        plot_bgcolor='white',
-        height=400
-    )
-
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-        fig.write_html(os.path.join(folder, "sequence_logo.html"))
-
-    st.plotly_chart(fig, use_container_width=True)
+        st.pyplot(fig)
+    except Exception as e:
+        st.error(f"Failed to generate Sequence Logo using logomaker: {e}")
 
     st.write("**Consensus Sequence:**")
     consensus_str = "".join(consensus_seq)
