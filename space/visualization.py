@@ -16,7 +16,7 @@ import streamlit as st
 from typing import List, Optional
 import py3Dmol
 from stmol import showmol
-import logomaker
+import math
 
 def visualize_al2co_seaborn(al2co_df: pd.DataFrame, folder: str = None):
     """
@@ -532,6 +532,24 @@ def generate_custom_gradient(color_list: list, number_of_colors: int) -> list:
 
     return gradient
 
+def calculate_information_content(counts, total_seqs):
+    if total_seqs == 0: return {}
+    probs = {k: v/total_seqs for k, v in counts.items()}
+    entropy = -sum(p * math.log2(p) for p in probs.values() if p > 0)
+    info_content = math.log2(20) - entropy
+    return {k: p * info_content for k, p in probs.items()}
+
+CHEMISTRY_COLORS = {
+    'D': '#E60A0A', 'E': '#E60A0A',
+    'R': '#145AFF', 'K': '#145AFF', 'H': '#145AFF',
+    'N': '#FA9600', 'Q': '#FA9600', 'S': '#FA9600', 'T': '#FA9600',
+    'A': '#323232', 'I': '#323232', 'L': '#323232', 'M': '#323232', 'V': '#323232',
+    'F': '#323232', 'W': '#323232', 'Y': '#323232',
+    'C': '#E6E600',
+    'G': '#EBEBEB',
+    'P': '#DC9682'
+}
+
 def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identity_threshold: float, folder: str = None):
     """
     Generates and visualizes a sequence logo and consensus sequence from an MSA file.
@@ -592,7 +610,8 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
         else:
             consensus_seq.append('X')
         
-        logo_data.append(non_gap_counts)
+        info_dict = calculate_information_content(non_gap_counts, total_seqs)
+        logo_data.append(info_dict)
         positions.append(mapped_ref)
 
     # If no data could be extracted
@@ -600,28 +619,47 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
         st.warning("No data extracted for the Sequence Logo.")
         return
 
-    counts_df = pd.DataFrame(logo_data, index=positions).fillna(0)
+    if logo_data:
+        all_aas = set()
+        for d in logo_data:
+            all_aas.update(d.keys())
 
-    try:
-        # Transform counts to information content (bits)
-        info_df = logomaker.transform_matrix(counts_df, from_type='counts', to_type='information')
-        
-        fig, ax = plt.subplots(figsize=(12, 4))
-        logo = logomaker.Logo(info_df, ax=ax, color_scheme='chemistry')
-        logo.style_spines(visible=False)
-        logo.style_spines(spines=['left', 'bottom'], visible=True)
-        ax.set_title("Sequence Logo")
-        ax.set_xlabel("Residue Position")
-        ax.set_ylabel("Information (bits)")
-        plt.tight_layout()
+        fig = go.Figure()
+
+        for aa in sorted(list(all_aas)):
+            y = []
+            text = []
+            for d in logo_data:
+                val = d.get(aa, 0)
+                y.append(val)
+                text.append(aa if val > 0.01 else "")
+
+            fig.add_trace(go.Bar(
+                x=positions,
+                y=y,
+                name=aa,
+                text=text,
+                textposition='inside',
+                insidetextanchor='middle',
+                marker_color=CHEMISTRY_COLORS.get(aa, '#808080'),
+                marker_line_width=0,
+                hoverinfo='x+y+name'
+            ))
+
+        fig.update_layout(
+            barmode='stack',
+            title="Sequence Logo (Information Content)",
+            xaxis_title="Residue Position",
+            yaxis_title="Information (bits)",
+            plot_bgcolor='white',
+            height=400
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
 
         if folder:
             os.makedirs(folder, exist_ok=True)
-            fig.savefig(os.path.join(folder, "sequence_logo.png"), dpi=300)
-
-        st.pyplot(fig)
-    except Exception as e:
-        st.error(f"Failed to generate Sequence Logo using logomaker: {e}")
+            fig.write_html(os.path.join(folder, "sequence_logo.html"))
 
     st.write("**Consensus Sequence:**")
     consensus_str = "".join(consensus_seq)
