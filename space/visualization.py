@@ -533,35 +533,104 @@ def generate_custom_gradient(color_list: list, number_of_colors: int) -> list:
     return gradient
 
 def calculate_information_content(counts, total_seqs):
-    if total_seqs == 0: return {}
-    probs = {k: v/total_seqs for k, v in counts.items()}
-    entropy = -sum(p * math.log2(p) for p in probs.values() if p > 0)
-    info_content = math.log2(20) - entropy
-    return {k: p * info_content for k, p in probs.items()}
-
-CHEMISTRY_COLORS = {
-    'D': '#E60A0A', 'E': '#E60A0A',
-    'R': '#145AFF', 'K': '#145AFF', 'H': '#145AFF',
-    'N': '#FA9600', 'Q': '#FA9600', 'S': '#FA9600', 'T': '#FA9600',
-    'A': '#323232', 'I': '#323232', 'L': '#323232', 'M': '#323232', 'V': '#323232',
-    'F': '#323232', 'W': '#323232', 'Y': '#323232',
-    'C': '#E6E600',
-    'G': '#EBEBEB',
-    'P': '#DC9682'
-}
-
-def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identity_threshold: float, folder: str = None):
     """
-    Generates and visualizes a sequence logo and consensus sequence from an MSA file.
-    Only positions present in the reference sequence are considered (using alignment_mapping).
-    If the identity of the most frequent amino acid at a position is below identity_threshold,
-    the position is set to 'X' in the consensus sequence.
+    Calculate information content (bits) per amino acid at a single position.
+
+    Uses the Schneider et al. (1986) formula with small-sample correction:
+        R(l) = log2(s) - (H(l) + e_n)
+    where s=20 (amino acid alphabet), H(l) is the observed Shannon entropy,
+    and e_n = (s-1) / (2 * ln(2) * n) is the small-sample correction.
 
     Args:
-        msa_file (str): Path to the FASTA MSA file.
-        alignment_mapping (list): Mapping of alignment columns to reference sequence positions.
-        identity_threshold (float): Required identity fraction to keep the true amino acid, otherwise 'X'.
-        folder (str): Directory to save the output HTML plot.
+        counts: dict mapping amino acid (str) -> count (int).
+                Should include ALL residues at this column (including gaps
+                counted as a character if desired, or excluded beforehand).
+        total_seqs: total number of sequences in the alignment (denominator).
+
+    Returns:
+        dict mapping amino acid -> bits contribution (height in logo).
+    """
+    if total_seqs == 0:
+        return {}
+
+    s = 20  # amino acid alphabet size
+    s_max = math.log2(s)  # ~4.322 bits
+
+    # Small-sample correction (Schneider et al., 1986)
+    e_n = (s - 1) / (2.0 * math.log(2) * total_seqs)
+
+    # Observed probabilities
+    probs = {k: v / total_seqs for k, v in counts.items()}
+
+    # Observed Shannon entropy
+    h_obs = -sum(p * math.log2(p) for p in probs.values() if p > 0)
+
+    # Information content, clamped to >= 0
+    info_content = max(0.0, s_max - h_obs - e_n)
+
+    return {k: p * info_content for k, p in probs.items()}
+
+
+# Standard WebLogo "chemistry" color scheme for amino acids.
+# Groupings:
+#   Acidic  (D, E)              -> Red
+#   Basic   (R, K, H)           -> Blue
+#   Polar   (S, T, N, Q, C, Y)  -> Green
+#   Hydrophobic (A, V, L, I, P, W, F, M) -> Black
+#   Glycine (G)                 -> Orange (structural breaker, special)
+CHEMISTRY_COLORS = {
+    # Acidic – red
+    'D': '#CC0000', 'E': '#CC0000',
+    # Basic – blue
+    'R': '#0000CC', 'K': '#0000CC', 'H': '#0000CC',
+    # Polar – green
+    'S': '#00CC00', 'T': '#00CC00', 'N': '#00CC00', 'Q': '#00CC00',
+    'C': '#00CC00', 'Y': '#00CC00',
+    # Hydrophobic – black
+    'A': '#000000', 'V': '#000000', 'L': '#000000', 'I': '#000000',
+    'P': '#000000', 'W': '#000000', 'F': '#000000', 'M': '#000000',
+    # Glycine – orange (structural breaker)
+    'G': '#FF8C00',
+    # Uncommon / ambiguous
+    'X': '#808080', 'B': '#808080', 'Z': '#808080', 'J': '#808080',
+}
+
+# Color legend groups for the annotation below the logo
+_CHEMISTRY_LEGEND = [
+    ('Acidic (D, E)', '#CC0000'),
+    ('Basic (R, K, H)', '#0000CC'),
+    ('Polar (S, T, N, Q, C, Y)', '#00CC00'),
+    ('Hydrophobic (A, V, L, I, P, W, F, M)', '#000000'),
+    ('Glycine (G)', '#FF8C00'),
+]
+
+
+def visualize_logo_and_consensus(
+    msa_file: str,
+    alignment_mapping: list,
+    identity_threshold: float,
+    folder: str = None,
+):
+    """
+    Generates and visualizes a production-grade sequence logo and consensus
+    sequence from an MSA file.
+
+    Information content is computed per the Schneider et al. (1986) formula
+    with small-sample correction.  Gaps are treated as an observed state when
+    computing entropy (they reduce the information content at that position)
+    but are **not** drawn as stacked bars—only amino-acid letters are shown.
+
+    Only alignment columns that map to a reference-sequence position (via
+    *alignment_mapping*) are included.
+
+    Args:
+        msa_file:  Path to the FASTA MSA file.
+        alignment_mapping:  List whose i-th element is the reference-sequence
+            position for alignment column *i*, or ``None`` for insert columns.
+        identity_threshold:  Fraction (0–1).  If the most-frequent amino acid
+            at a position has a frequency below this value the consensus
+            residue is set to ``'X'``.
+        folder:  Optional directory to save the output HTML plot.
     """
     if not msa_file or not os.path.exists(msa_file):
         st.error("MSA file not found.")
@@ -574,14 +643,15 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
         return
 
     aln_len = alignment.get_alignment_length()
+    n_seqs = len(alignment)
 
     # Read the alignment into a NumPy array for speed
     arr = np.array([list(str(rec.seq)) for rec in alignment], dtype="U1")
 
-    # Initialize variables for the logo and consensus
-    logo_data = []
-    consensus_seq = []
-    positions = []
+    # ── per-position computation ──────────────────────────────────────────
+    logo_data: List[dict] = []   # each entry: {aa: bits, ...}
+    consensus_seq: List[str] = []
+    positions: List[int] = []
 
     for i in range(aln_len):
         mapped_ref = alignment_mapping[i]
@@ -589,78 +659,129 @@ def visualize_logo_and_consensus(msa_file: str, alignment_mapping: list, identit
             continue
 
         col = arr[:, i]
-        total_seqs = len(col)
-        counts = Counter(col)
+        counts_raw = Counter(col)
 
-        # Calculate non-gap counts
-        non_gap_counts = {k.upper(): v for k, v in counts.items() if k != '-'}
+        # Normalise keys to uppercase; keep gaps as '-'
+        counts_all: dict = {}
+        for k, v in counts_raw.items():
+            key = k.upper() if k != '-' else '-'
+            counts_all[key] = counts_all.get(key, 0) + v
+
+        non_gap_counts = {k: v for k, v in counts_all.items() if k != '-'}
 
         if not non_gap_counts:
-            # All gaps, rare but possible
+            # Entire column is gaps
             consensus_seq.append('-')
             positions.append(mapped_ref)
             logo_data.append({})
             continue
 
-        most_common_aa, most_common_count = Counter(non_gap_counts).most_common(1)[0]
-        identity = most_common_count / total_seqs
-        
+        # ── Consensus ─────────────────────────────────────────────────────
+        most_common_aa = max(non_gap_counts, key=non_gap_counts.get)
+        most_common_count = non_gap_counts[most_common_aa]
+        identity = most_common_count / n_seqs
+
         if identity >= identity_threshold:
             consensus_seq.append(most_common_aa)
         else:
             consensus_seq.append('X')
-        
-        info_dict = calculate_information_content(non_gap_counts, total_seqs)
+
+        # ── Information content ───────────────────────────────────────────
+        # Use *all* counts (including gaps) so that gappy positions have
+        # lower information content, matching the standard WebLogo approach.
+        info_dict_full = calculate_information_content(counts_all, n_seqs)
+
+        # Keep only non-gap entries for the visual stack
+        info_dict = {k: v for k, v in info_dict_full.items() if k != '-'}
+
         logo_data.append(info_dict)
         positions.append(mapped_ref)
 
-    # If no data could be extracted
+    # ── guard ─────────────────────────────────────────────────────────────
     if not logo_data:
         st.warning("No data extracted for the Sequence Logo.")
         return
 
-    if logo_data:
-        all_aas = set()
-        for d in logo_data:
-            all_aas.update(d.keys())
+    # ── Collect all amino acids that appear anywhere ──────────────────────
+    all_aas: set = set()
+    for d in logo_data:
+        all_aas.update(d.keys())
 
-        fig = go.Figure()
+    # ── Build Plotly stacked-bar logo ─────────────────────────────────────
+    fig = go.Figure()
 
-        for aa in sorted(list(all_aas)):
-            y = []
-            text = []
-            for d in logo_data:
-                val = d.get(aa, 0)
-                y.append(val)
-                text.append(aa if val > 0.01 else "")
+    for aa in sorted(all_aas):
+        y_vals = []
+        hover_texts = []
+        bar_texts = []
+        for pos, d in zip(positions, logo_data):
+            bits = d.get(aa, 0)
+            y_vals.append(bits)
+            bar_texts.append(aa if bits > 0.05 else "")
+            hover_texts.append(
+                f"Position {pos}<br>"
+                f"Amino acid: {aa}<br>"
+                f"Contribution: {bits:.3f} bits"
+            )
 
-            fig.add_trace(go.Bar(
-                x=positions,
-                y=y,
-                name=aa,
-                text=text,
-                textposition='inside',
-                insidetextanchor='middle',
-                marker_color=CHEMISTRY_COLORS.get(aa, '#808080'),
-                marker_line_width=0,
-                hoverinfo='x+y+name'
-            ))
+        fig.add_trace(go.Bar(
+            x=positions,
+            y=y_vals,
+            name=aa,
+            text=bar_texts,
+            textposition='inside',
+            insidetextanchor='middle',
+            textfont=dict(family='Arial Black, Arial', size=11),
+            marker_color=CHEMISTRY_COLORS.get(aa, '#808080'),
+            marker_line_width=0,
+            hovertext=hover_texts,
+            hoverinfo='text',
+        ))
 
-        fig.update_layout(
-            barmode='stack',
-            title="Sequence Logo (Information Content)",
-            xaxis_title="Residue Position",
-            yaxis_title="Information (bits)",
-            plot_bgcolor='white',
-            height=400
-        )
+    # ── Layout ────────────────────────────────────────────────────────────
+    fig.update_layout(
+        barmode='stack',
+        bargap=0,
+        title=dict(
+            text=f"Sequence Logo — {n_seqs} sequences, {len(positions)} positions",
+            font=dict(size=16),
+        ),
+        xaxis_title="Residue Position",
+        yaxis_title="Information (bits)",
+        yaxis=dict(
+            range=[0, math.log2(20) + 0.1],  # 0 – 4.42
+            dtick=1.0,
+        ),
+        plot_bgcolor='white',
+        height=420,
+        legend=dict(
+            title="Amino Acid",
+            orientation='h',
+            yanchor='bottom',
+            y=-0.35,
+            xanchor='center',
+            x=0.5,
+            font=dict(size=10),
+        ),
+    )
 
-        st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-            fig.write_html(os.path.join(folder, "sequence_logo.html"))
+    # ── Color legend ──────────────────────────────────────────────────────
+    legend_html = ' &nbsp; '.join(
+        f'<span style="color:{color}; font-weight:bold;">■</span> {label}'
+        for label, color in _CHEMISTRY_LEGEND
+    )
+    st.markdown(
+        f'<div style="text-align:center; font-size:0.85em; margin-top:-12px;">{legend_html}</div>',
+        unsafe_allow_html=True,
+    )
 
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        fig.write_html(os.path.join(folder, "sequence_logo.html"))
+
+    # ── Consensus ─────────────────────────────────────────────────────────
     st.write("**Consensus Sequence:**")
     consensus_str = "".join(consensus_seq)
     st.code(consensus_str, language="text")
