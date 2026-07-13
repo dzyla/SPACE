@@ -1,0 +1,2 @@
+gcc
+libgomp1

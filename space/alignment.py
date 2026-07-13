@@ -8,7 +8,6 @@ import random
 import re
 import traceback
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Sequence as _Sequence, Tuple
 
@@ -24,6 +23,7 @@ from Bio.SeqRecord import SeqRecord
 from pyfamsa import Aligner as FamsaAligner, Sequence as FamsaSequence
 
 from .utils import clean_fasta
+from .visualization import SEQUENTIAL_BLUE_ACCENT
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +98,6 @@ def perform_alignment(
         st.error("No valid sequences to align.")
         return None, None
 
-    # Sensible worker cap to avoid oversubscription
-    import os as _os
-    max_workers = min(max(1, (_os.cpu_count() or 4) - 1), 8)
-
     scores: List[float] = []
     sequences: List[str] = []
     id_list: List[str] = []
@@ -116,26 +112,30 @@ def perform_alignment(
     done = 0
     alignment_errors: List[Tuple[str, int]] = []
 
+    # Run sequentially: BLOSUM62 global alignment is ~2ms/sequence, so a few
+    # hundred sequences finish in well under a second. Deliberately not using
+    # ProcessPoolExecutor here — it relies on POSIX semaphores in /dev/shm,
+    # which are frequently restricted or absent in sandboxed hosting
+    # environments (e.g. Streamlit Community Cloud), where it crashes the
+    # whole app rather than raising a catchable Python exception.
     try:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_align_one, item) for item in seq_data]
-            for fut in as_completed(futures):
-                score, seq_str, seq_id = fut.result()
-                if score is not None:
-                    scores.append(score)
-                    sequences.append(seq_str)
-                    id_list.append(seq_id)
+        for item in seq_data:
+            score, seq_str, seq_id = _align_one(item)
+            if score is not None:
+                scores.append(score)
+                sequences.append(seq_str)
+                id_list.append(seq_id)
 
-                    min_score = min(min_score, score)
-                    max_score = max(max_score, score)
-                    L = len(seq_str)
-                    min_seq_length = min(min_seq_length, L)
-                    max_seq_length = max(max_seq_length, L)
-                else:
-                    alignment_errors.append((seq_id, len(seq_str)))
+                min_score = min(min_score, score)
+                max_score = max(max_score, score)
+                L = len(seq_str)
+                min_seq_length = min(min_seq_length, L)
+                max_seq_length = max(max_seq_length, L)
+            else:
+                alignment_errors.append((seq_id, len(seq_str)))
 
-                done += 1
-                progress.progress(done / total)
+            done += 1
+            progress.progress(done / total)
     except Exception as e:
         st.error(f"An error occurred during alignment: {e}")
         st.text(traceback.format_exc())
@@ -417,22 +417,27 @@ def _build_upgma_figure(Z, labels: List[str], gl_threshold: int = 300) -> go.Fig
 
     trace_cls = go.Scattergl if len(leaf_labels) >= gl_threshold else go.Scatter
     fig = go.Figure()
-    fig.add_trace(trace_cls(x=edge_x, y=edge_y, mode="lines", line=dict(width=1), showlegend=False))
+    fig.add_trace(trace_cls(
+        x=edge_x, y=edge_y, mode="lines",
+        line=dict(width=1, color="#898781"), showlegend=False, hoverinfo="skip",
+    ))
     leaf_x = list(range(1, len(leaf_labels) + 1))
     leaf_y = [0] * len(leaf_labels)
     fig.add_trace(
         trace_cls(
             x=leaf_x, y=leaf_y, mode="markers+text",
             text=leaf_labels, textposition="top center",
-            marker=dict(size=5), showlegend=False,
+            textfont=dict(size=9, color="#52514e"),
+            marker=dict(size=6, color=SEQUENTIAL_BLUE_ACCENT), showlegend=False,
             hovertext=leaf_labels, hoverinfo="text",
         )
     )
     fig.update_layout(
+        title=dict(text=f"UPGMA tree — {len(leaf_labels)} sequences", font=dict(size=13)),
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(title="Distance", showgrid=True, zeroline=False),
-        plot_bgcolor="white",
-        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(title="Distance", showgrid=True, gridcolor="#e1e0d9", zeroline=False),
+        plot_bgcolor="#fcfcfb",
+        margin=dict(l=10, r=10, t=40, b=10),
     )
     return fig
 
@@ -549,13 +554,26 @@ def plot_phylogenetic_tree(tree_file: str, st_column: Optional = None):
 
         collect_nodes(tree.root)
 
+        n_leaves = len(tree.get_terminals())
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(color="black", width=1), hoverinfo="none", showlegend=False))
-        fig.add_trace(go.Scatter(x=node_x, y=node_y, mode="markers+text", marker=dict(symbol="circle", size=6), text=node_labels, textposition="middle right", hoverinfo="text", showlegend=False))
+        fig.add_trace(go.Scatter(
+            x=edge_x, y=edge_y, mode="lines",
+            line=dict(color="#898781", width=1), hoverinfo="none", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=node_x, y=node_y, mode="markers+text",
+            marker=dict(symbol="circle", size=7, color=SEQUENTIAL_BLUE_ACCENT,
+                        line=dict(width=1, color="#fcfcfb")),
+            text=node_labels, textposition="middle right",
+            textfont=dict(size=10, color="#52514e"),
+            hoverinfo="text", showlegend=False,
+        ))
         fig.update_layout(
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            title=dict(text=f"Neighbor-joining tree — {n_leaves} sequences", font=dict(size=13)),
+            xaxis=dict(title="Branch length", showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            plot_bgcolor="white", width=800, height=600,
+            plot_bgcolor="#fcfcfb", width=800, height=600,
+            margin=dict(t=40),
         )
 
         # Save HTML next to the Newick

@@ -121,7 +121,11 @@ def download_alphafold_pdb(accession: str, save_dir: str = '.') -> str:
 
 def get_protein_data(accession: str) -> dict:
     url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
-    response = requests.get(url)
+    try:
+        response = requests.get(url, timeout=15)
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Failed to reach UniProt for ID {accession}: {e}")
+        return {}
     if response.status_code == 200:
         return response.json()
     else:

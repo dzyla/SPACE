@@ -32,7 +32,7 @@ pip install -r requirements.txt
 or:
 
 ```bash
-pip install streamlit py3Dmol stmol pandas biopython plotly kaleido scipy biopandas ipython_genutils joblib seaborn rcsbsearchapi
+pip install streamlit py3Dmol stmol pandas biopython plotly scipy biopandas seaborn
 ```
 
 ## Usage

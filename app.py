@@ -6,6 +6,8 @@ import io
 import logging
 import os
 import platform
+import socket
+import time
 import traceback
 import uuid
 import zipfile
@@ -40,12 +42,42 @@ st.set_page_config(
 
 logging.basicConfig(level=logging.INFO)
 
+# Guard against indefinite hangs on stalled NCBI/UniProt connections (Bio.Entrez
+# has no per-call timeout of its own) — without this, a stalled request can
+# freeze the whole session, which looks like a crash from the user's side.
+socket.setdefaulttimeout(60)
+
 # -----------------------------------
 # Session-scoped output directory
 # -----------------------------------
+SESSIONS_ROOT = Path("sessions")
+SESSION_MAX_AGE_HOURS = 24
+
+
+def _prune_stale_sessions(root: Path, max_age_hours: float) -> None:
+    """
+    Delete session directories older than max_age_hours. Public deployments
+    (e.g. Streamlit Community Cloud) have limited/ephemeral disk quota, and
+    session dirs are otherwise never cleaned up — left unchecked they
+    accumulate across users and can fill the disk, crashing the app.
+    """
+    if not root.exists():
+        return
+    import shutil
+
+    cutoff = time.time() - max_age_hours * 3600
+    for entry in root.iterdir():
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
 if "session_dir" not in st.session_state:
+    _prune_stale_sessions(SESSIONS_ROOT, SESSION_MAX_AGE_HOURS)
     session_id = uuid.uuid4().hex
-    session_dir = Path(f"sessions/{session_id}")
+    session_dir = SESSIONS_ROOT / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     st.session_state.session_dir = session_dir
 else:
@@ -458,32 +490,65 @@ and understanding protein sequences and their conservation in 2D and 3D.
             list(st.session_state.unique_mutations.items()),
             columns=["Sequence ID", "Mutations"],
         )
-        st.dataframe(muts_df, hide_index=True, use_container_width=True)
-
-        # All unique mutations text
-        st.subheader("All Unique Point Mutations")
-        if st.session_state.all_mutations_str:
-            count = len(st.session_state.all_mutations_str.split(";"))
-            st.text_area(
-                f"All Unique Mutations ({count})",
-                value=st.session_state.all_mutations_str,
-                height=100,
-            )
-        else:
-            st.write("No mutations to display.")
-        c1, c2 = st.columns(2)
+        muts_df["Mutation Count"] = muts_df["Mutations"].apply(
+            lambda m: 0 if m == "No mutations" else len(m.split(", "))
+        )
+        muts_df = muts_df.sort_values("Mutation Count", ascending=False).reset_index(drop=True)
+        st.dataframe(
+            muts_df,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Sequence ID": st.column_config.TextColumn(width="medium"),
+                "Mutations": st.column_config.TextColumn(width="large"),
+                "Mutation Count": st.column_config.NumberColumn(
+                    "# Mutations", help="Number of point mutations vs. the reference sequence"
+                ),
+            },
+        )
 
         # Save CSVs
         muts_export = get_mutation_dataframe()
         if not muts_export.empty:
             csv1 = out_path("tables/point_mutations.tsv")
             muts_export.to_csv(csv1, index=False, sep="\t")
-            st.success(f"Point mutations saved to `{csv1}`.")
         unique_muts_df = muts_export.drop_duplicates(subset=["Mutation"])
         if not unique_muts_df.empty:
             csv2 = out_path("tables/unique_point_mutations.csv")
             unique_muts_df.to_csv(csv2, index=False)
-            st.success(f"Unique point mutations saved to `{csv2}`.")
+
+        # All unique mutations: sortable summary table (Mutation, Count, Frequency)
+        st.subheader("All Unique Point Mutations")
+        if not muts_export.empty:
+            summary_counts = muts_export["Mutation"].value_counts().reset_index()
+            summary_counts.columns = ["Mutation", "Count"]
+            n_sequences = st.session_state.msa_image.shape[0]
+            summary_counts["Frequency"] = summary_counts["Count"] / n_sequences
+            summary_counts["Position"] = summary_counts["Mutation"].str.extract(r"(\d+)").astype(int)
+            summary_counts = summary_counts.sort_values("Count", ascending=False).reset_index(drop=True)
+
+            st.dataframe(
+                summary_counts[["Mutation", "Position", "Count", "Frequency"]],
+                hide_index=True,
+                use_container_width=True,
+                height=250,
+                column_config={
+                    "Frequency": st.column_config.ProgressColumn(
+                        "Frequency (%)", format="%.1f%%", min_value=0.0, max_value=1.0
+                    ),
+                },
+            )
+            with st.expander(f"Copy as plain text ({len(summary_counts)} mutations)"):
+                st.text_area(
+                    "All unique mutations",
+                    value=st.session_state.all_mutations_str,
+                    height=100,
+                    label_visibility="collapsed",
+                )
+        else:
+            st.write("No mutations to display.")
+
+        c1, c2 = st.columns(2)
 
         # Switchable histogram plots
         c1.subheader("Mutation Frequency Analysis")
@@ -494,19 +559,26 @@ and understanding protein sequences and their conservation in 2D and 3D.
         )
 
         if plot_type == "Mutation frequency histogram":
-            # Compute mutation counts
+            # Compute mutation counts, sorted so the most frequent mutation reads first
             counts = muts_export["Mutation"].value_counts().reset_index()
             counts.columns = ["Mutation", "Count"]
 
             # Show the mutation counts as a fraction of all sequences
             max_count = st.session_state.msa_image.shape[0]
             counts["Count"] = counts["Count"] / max_count * 100
+            counts = counts.sort_values("Count", ascending=False)
             fig = px.bar(
                 counts,
                 x="Mutation",
                 y="Count",
                 title="Frequency of Each Point Mutation",
                 labels={"Count": "Frequency (%)"},
+            )
+            fig.update_traces(marker_color=SEQUENTIAL_BLUE_ACCENT, hovertemplate="%{x}<br>Frequency: %{y:.1f}%<extra></extra>")
+            fig.update_layout(
+                plot_bgcolor='#fcfcfb',
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor='#e1e0d9', zeroline=False),
             )
             c1.plotly_chart(fig, use_container_width=True)
         else:
@@ -522,6 +594,12 @@ and understanding protein sequences and their conservation in 2D and 3D.
                 x="Index",
                 y="Unique Mutations Count",
                 title="Unique Mutation Types per Residue Index",
+            )
+            fig.update_traces(marker_color=SEQUENTIAL_BLUE_ACCENT, hovertemplate="Position %{x}<br>%{y} mutation types<extra></extra>")
+            fig.update_layout(
+                plot_bgcolor='#fcfcfb',
+                xaxis=dict(showgrid=False, title="Residue Position"),
+                yaxis=dict(showgrid=True, gridcolor='#e1e0d9', zeroline=False),
             )
             c1.plotly_chart(fig, use_container_width=True)
 
@@ -638,10 +716,21 @@ and understanding protein sequences and their conservation in 2D and 3D.
 
             # Metadata
             md = result["metadata"]
-            c1.write(f"**PDB ID:** {md['pdb_id']}")
-            c1.write(f"**Title:** {md['title']}")
-            c1.write(f"**Authors:** {md['authors']}")
-            c1.write(f"**Deposition date:** {md['date']}")
+            metadata_df = pd.DataFrame(
+                {
+                    "Field": ["PDB ID", "Title", "Authors", "Deposition date"],
+                    "Value": [md['pdb_id'], md['title'], md['authors'], md['date']],
+                }
+            )
+            c1.dataframe(
+                metadata_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Field": st.column_config.TextColumn(width="small"),
+                    "Value": st.column_config.TextColumn(width="large"),
+                },
+            )
 
             chain_ids = list(result["chain_data"].keys())
 

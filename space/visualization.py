@@ -18,6 +18,24 @@ import py3Dmol
 from stmol import showmol
 import math
 
+# Single-hue sequential ramp (light -> dark blue) for magnitude/density
+# encodings (counts, density), kept separate from CHEMISTRY_COLORS which
+# encodes categorical amino-acid identity. Using one hue end-to-end for a
+# density/count value is standard practice — a multi-hue ("rainbow") scale
+# implies perceptual breakpoints the data doesn't have and reads unevenly
+# for viewers with color vision deficiencies.
+SEQUENTIAL_BLUE = [
+    [0.00, '#cde2fb'],
+    [0.15, '#9ec5f4'],
+    [0.30, '#6da7ec'],
+    [0.45, '#3987e5'],
+    [0.60, '#2a78d6'],
+    [0.75, '#1c5cab'],
+    [1.00, '#0d366b'],
+]
+SEQUENTIAL_BLUE_ACCENT = '#2a78d6'  # single-series bar/marker accent
+
+
 def visualize_al2co_seaborn(al2co_df: pd.DataFrame, folder: str = None):
     """
     Visualizes al2co conservation scores using Seaborn.
@@ -190,29 +208,25 @@ def visualize_hexbin_plot(
             z=np.log(heatmap + 1),  # Added 1 to avoid log(0)
             x=xedges,
             y=yedges,
-            colorscale="Portland",
-            colorbar=dict(title="Density (log scale)"),  # Updated title to reflect log scale
+            colorscale=SEQUENTIAL_BLUE,
+            colorbar=dict(title="Density<br>(log scale)", ticks='outside'),
             customdata=heatmap,                  # Pass original z values for hover
             hovertemplate=                       # Define custom hover template
-                'X: %{x}<br>' +
-                'Y: %{y}<br>' +
-                'Density: %{customdata}<extra></extra>',  # Display original z
+                'Sequence length: %{x:.0f}<br>' +
+                'Sequence identity: %{y:.1f}%<br>' +
+                'Sequences in bin: %{customdata:.0f}<extra></extra>',
             zmin=np.log(heatmap + 1).min(),
             zmax=np.log(heatmap + 1).max(),
         )
     )
     fig.update_layout(
-        title="Density Heatmap of Sequence Length and Alignment Score",
-        xaxis_title="Sequence Length",
-        yaxis_title="Sequence identity, %",
+        title="Sequence Length vs. Alignment Identity",
+        xaxis_title="Sequence Length (aa)",
+        yaxis_title="Sequence Identity to Reference (%)",
         height=600,
-        xaxis=dict(
-            showgrid=True,           # Enable vertical grid lines
-        ),
-        yaxis=dict(
-            showgrid=True,           # Enable horizontal grid lines
-        ),
-        plot_bgcolor='white'         # Optional: Set background color for better contrast
+        xaxis=dict(showgrid=True, gridcolor='#e1e0d9', zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor='#e1e0d9', zeroline=False),
+        plot_bgcolor='#fcfcfb',
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -282,6 +296,36 @@ def msa_to_image(msa_file: str) -> tuple:
     return msa_image, msa_letters
 
 
+_MSA_GAP_COLOR = '#e1e0d9'  # recedes into the surface, matching the gridline token
+
+# AA_CODES integer -> letter, duplicated here (not imported from msa_to_image)
+# to keep this a self-contained lookup for the discrete colorscale below.
+_CODE_TO_AA = {
+    0: '-', 1: 'A', 2: 'C', 3: 'D', 4: 'E', 5: 'F', 6: 'G', 7: 'H', 8: 'I',
+    9: 'K', 10: 'L', 11: 'M', 12: 'N', 13: 'P', 14: 'Q', 15: 'R', 16: 'S',
+    17: 'T', 18: 'V', 19: 'W', 20: 'Y', 21: 'X', 22: 'B', 23: 'J', 24: 'O',
+    25: 'Z',
+}
+
+
+def _discrete_chemistry_colorscale() -> list:
+    """
+    A stepped (non-interpolated) Plotly colorscale over the 26 integer AA
+    codes used by msa_to_image, reusing the same validated CHEMISTRY_COLORS
+    as the sequence logo so the two views read as one system. A gradient
+    colorscale (e.g. "Spectral") would imply an ordering between amino acids
+    that doesn't exist — these are nominal categories, so each band is a flat
+    color with a hard edge to its neighbor.
+    """
+    n = len(_CODE_TO_AA)
+    scale = []
+    for code, aa in _CODE_TO_AA.items():
+        color = _MSA_GAP_COLOR if aa == '-' else CHEMISTRY_COLORS.get(aa, '#ADB5BD')
+        scale.append([code / n, color])
+        scale.append([(code + 1) / n, color])
+    return scale
+
+
 def plot_msa_image(msa_image: np.ndarray, msa_letters: np.ndarray, folder: str = './'):
     """
     Plots the Multiple Sequence Alignment (MSA) as a heatmap with amino acid hover information.
@@ -315,25 +359,27 @@ def plot_msa_image(msa_image: np.ndarray, msa_letters: np.ndarray, folder: str =
             z=msa_image_list,
             text=hover_text,
             hoverinfo="text",
-            colorscale="Spectral",
-            showscale=False  # Hide the color scale to remove extra traces
+            colorscale=_discrete_chemistry_colorscale(),
+            zmin=0,
+            zmax=len(_CODE_TO_AA) - 1,
+            xgap=0,
+            ygap=0,
+            showscale=False,  # legend is the chemistry-class swatch below instead
         )
     )
 
-    # Update hovertemplate to display X, Y, and Text
-    # Note: Using hoverinfo="text" and pre-formatted hover_text, so no need for hovertemplate
-    # However, if you prefer to use hovertemplate, you can adjust accordingly
     fig.update_traces(
-        hovertemplate="%{text}<extra></extra>"  # <extra></extra> removes the trace info
+        hovertemplate="%{text}<extra></extra>"
     )
 
     fig.update_layout(
-        title="Multiple Sequence Alignment View",
+        title="Multiple Sequence Alignment Overview",
         xaxis_title="MSA Residue Position",
         yaxis_title="Sequence Number",
-        xaxis=dict(ticks='', showticklabels=True),
-        yaxis=dict(ticks='', showticklabels=True),
-        plot_bgcolor='white'
+        xaxis=dict(ticks='', showticklabels=True, showgrid=False),
+        yaxis=dict(ticks='', showticklabels=True, showgrid=False, autorange='reversed'),
+        plot_bgcolor='#fcfcfb',
+        margin=dict(t=50, b=10),
     )
 
     # Save the plot as an HTML file (optional)
@@ -341,6 +387,15 @@ def plot_msa_image(msa_image: np.ndarray, msa_letters: np.ndarray, folder: str =
 
     # Display the plot in Streamlit
     st.plotly_chart(fig, use_container_width=True)
+
+    legend_html = ' &nbsp; '.join(
+        f'<span style="color:{color}; font-weight:bold;">■</span> {label}'
+        for label, color in _CHEMISTRY_LEGEND
+    ) + f' &nbsp; <span style="color:{_MSA_GAP_COLOR}; font-weight:bold;">■</span> Gap'
+    st.markdown(
+        f'<div style="text-align:center; font-size:0.85em; margin-top:-12px;">{legend_html}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def visualize_mutations_scatter(reference_seq: str, unique_mutations: dict, st_column: Optional = None):
@@ -571,38 +626,71 @@ def calculate_information_content(counts, total_seqs):
     return {k: p * info_content for k, p in probs.items()}
 
 
-# Standard WebLogo "chemistry" color scheme for amino acids.
+# Standard WebLogo "chemistry" color scheme for amino acids, re-tuned so
+# every fill actually reads against a white plot background and against the
+# in-bar text drawn on top of it (the original #CC0000/#0000CC/#00CC00/#000000
+# set failed lightness, chroma and contrast checks — validated with the
+# dataviz skill's validate_palette.js — and #000000 in particular made the
+# residue letters invisible: black text on a pure-black bar).
 # Groupings:
 #   Acidic  (D, E)              -> Red
 #   Basic   (R, K, H)           -> Blue
 #   Polar   (S, T, N, Q, C, Y)  -> Green
-#   Hydrophobic (A, V, L, I, P, W, F, M) -> Black
+#   Hydrophobic (A, V, L, I, P, W, F, M) -> Neutral slate (deliberately
+#       low-chroma: WebLogo convention uses an achromatic color here
+#       specifically because this group has no distinctive side-chain
+#       chemistry — a saturated hue would misleadingly imply one)
 #   Glycine (G)                 -> Orange (structural breaker, special)
 CHEMISTRY_COLORS = {
     # Acidic – red
-    'D': '#CC0000', 'E': '#CC0000',
+    'D': '#E03131', 'E': '#E03131',
     # Basic – blue
-    'R': '#0000CC', 'K': '#0000CC', 'H': '#0000CC',
+    'R': '#1971C2', 'K': '#1971C2', 'H': '#1971C2',
     # Polar – green
-    'S': '#00CC00', 'T': '#00CC00', 'N': '#00CC00', 'Q': '#00CC00',
-    'C': '#00CC00', 'Y': '#00CC00',
-    # Hydrophobic – black
-    'A': '#000000', 'V': '#000000', 'L': '#000000', 'I': '#000000',
-    'P': '#000000', 'W': '#000000', 'F': '#000000', 'M': '#000000',
+    'S': '#2F9E44', 'T': '#2F9E44', 'N': '#2F9E44', 'Q': '#2F9E44',
+    'C': '#2F9E44', 'Y': '#2F9E44',
+    # Hydrophobic – neutral slate
+    'A': '#52585E', 'V': '#52585E', 'L': '#52585E', 'I': '#52585E',
+    'P': '#52585E', 'W': '#52585E', 'F': '#52585E', 'M': '#52585E',
     # Glycine – orange (structural breaker)
-    'G': '#FF8C00',
+    'G': '#E8590C',
     # Uncommon / ambiguous
-    'X': '#808080', 'B': '#808080', 'Z': '#808080', 'J': '#808080',
+    'X': '#ADB5BD', 'B': '#ADB5BD', 'Z': '#ADB5BD', 'J': '#ADB5BD',
 }
 
 # Color legend groups for the annotation below the logo
 _CHEMISTRY_LEGEND = [
-    ('Acidic (D, E)', '#CC0000'),
-    ('Basic (R, K, H)', '#0000CC'),
-    ('Polar (S, T, N, Q, C, Y)', '#00CC00'),
-    ('Hydrophobic (A, V, L, I, P, W, F, M)', '#000000'),
-    ('Glycine (G)', '#FF8C00'),
+    ('Acidic (D, E)', '#E03131'),
+    ('Basic (R, K, H)', '#1971C2'),
+    ('Polar (S, T, N, Q, C, Y)', '#2F9E44'),
+    ('Hydrophobic (A, V, L, I, P, W, F, M)', '#52585E'),
+    ('Glycine (G)', '#E8590C'),
 ]
+
+
+def _relative_luminance(hex_color: str) -> float:
+    """WCAG relative luminance of a #RRGGBB color, for text-contrast choice."""
+    hex_color = hex_color.lstrip('#')
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+    def _lin(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = _lin(r), _lin(g), _lin(b)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast_ratio(hex_a: str, hex_b: str) -> float:
+    la, lb = _relative_luminance(hex_a), _relative_luminance(hex_b)
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _text_color_for(bg_hex: str) -> str:
+    """Pick black or white text, whichever contrasts more against bg_hex."""
+    white_contrast = _contrast_ratio(bg_hex, '#ffffff')
+    black_contrast = _contrast_ratio(bg_hex, '#000000')
+    return '#ffffff' if white_contrast >= black_contrast else '#000000'
 
 
 def visualize_logo_and_consensus(
@@ -724,6 +812,8 @@ def visualize_logo_and_consensus(
                 f"Contribution: {bits:.3f} bits"
             )
 
+        bar_color = CHEMISTRY_COLORS.get(aa, '#ADB5BD')
+
         fig.add_trace(go.Bar(
             x=positions,
             y=y_vals,
@@ -731,8 +821,12 @@ def visualize_logo_and_consensus(
             text=bar_texts,
             textposition='inside',
             insidetextanchor='middle',
-            textfont=dict(family='Arial Black, Arial', size=11),
-            marker_color=CHEMISTRY_COLORS.get(aa, '#808080'),
+            textfont=dict(
+                family='Arial Black, Arial',
+                size=11,
+                color=_text_color_for(bar_color),
+            ),
+            marker_color=bar_color,
             marker_line_width=0,
             hovertext=hover_texts,
             hoverinfo='text',

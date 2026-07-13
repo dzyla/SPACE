@@ -6,6 +6,8 @@
 *.nwk
 *.csv
 *.txt
+!packages.txt
+!requirements.txt
 space/__pycache__/*
 sessions/*
 *safeBackup*

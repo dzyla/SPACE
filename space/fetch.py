@@ -17,6 +17,15 @@ def search_and_save_protein_ncbi(
 ) -> str:
     
     Entrez.email = email
+
+    # Cap how many IDs we ask NCBI for. Requesting retmax in the millions for
+    # a broad query pulls a huge ID list into memory before we even get to
+    # max_seqs filtering; a generous multiple of max_seqs is enough headroom
+    # to combine with the Swiss-Prot search and still land on max_seqs after
+    # truncation. When max_seqs == -1 ("all"), fall back to a large-but-finite
+    # cap rather than an effectively unbounded one.
+    search_retmax = max(max_seqs * 3, 300) if max_seqs != -1 else 20000
+
     try:
         if not use_refseq:
             handle_original = Entrez.esearch(
@@ -24,7 +33,7 @@ def search_and_save_protein_ncbi(
                 term=query,
                 sort="relevance",
                 idtype="acc",
-                retmax=10000000,
+                retmax=search_retmax,
             )
         else:
             modified_query = query + " AND refseq[filter]"
@@ -34,9 +43,9 @@ def search_and_save_protein_ncbi(
                 term=modified_query,
                 sort="relevance",
                 idtype="acc",
-                retmax=10000000,
+                retmax=search_retmax,
             )
-        
+
         search_results_original = Entrez.read(handle_original, ignore_errors=True)
         id_list_original = search_results_original.get("IdList", [])
         handle_original.close()
@@ -48,22 +57,25 @@ def search_and_save_protein_ncbi(
             term=swissprot_query,
             sort="relevance",
             idtype="acc",
-            retmax=99999999,
+            retmax=search_retmax,
         )
         search_results_swissprot = Entrez.read(handle_swissprot, ignore_errors=True)
         id_list_swissprot = search_results_swissprot.get("IdList", [])
         handle_swissprot.close()
-        
+
         st.success(f"Found {len(id_list_swissprot)} IDs from Swiss-Prot filtered search and {len(id_list_original)} IDs from original NCBI search.")
 
-        combined_id_set = set(id_list_original) | set(id_list_swissprot)
-        combined_id_list = list(combined_id_set)
+        # Both lists come back ordered by relevance (sort="relevance"); use
+        # dict.fromkeys instead of set() to dedupe while preserving that
+        # order, otherwise the later max_seqs truncation below picks an
+        # arbitrary hash-order subset instead of the most relevant hits.
+        combined_id_list = list(dict.fromkeys(id_list_original + id_list_swissprot))
 
 
         if max_seqs != -1 and max_seqs < len(combined_id_list):
             combined_id_list = combined_id_list[:max_seqs]
             st.info(f"Total unique IDs after combining both searches: {len(combined_id_list)}. Using first {len(combined_id_list)} IDs after applying max_seqs.")
-        
+
         else:
             st.info(f"Total unique IDs after combining both searches: {len(combined_id_list)}.")
 
@@ -111,7 +123,7 @@ def search_and_save_protein_uniprot(
     
     query_url = f"{base_url}{requests.utils.quote(query)}&format=fasta&size=500"
     try:
-        response = requests.get(query_url)
+        response = requests.get(query_url, timeout=30)
         response.raise_for_status()
         sequences = response.text
         with open(filename, "w") as f:
