@@ -1,2 +1,12 @@
-[theme]
-base="light"
+# Separate light/dark sections keep the "use system setting" theme switch working;
+# a bare [theme] block would pin the app to the light base.
+[theme.light]
+primaryColor = "#2a78d6"
+baseRadius = "0.5rem"
+
+[theme.dark]
+primaryColor = "#3987e5"
+baseRadius = "0.5rem"
+
+[server]
+maxUploadSize = 50

@@ -1,65 +1,47 @@
-# SPACE Usage Skill
+# SPACE usage skill
 
-Reusable skill for running the SPACE (Sequence Protein Alignment and Conservation
-Engine) pipeline headlessly or via Streamlit.
+Find protein variants across NCBI / UniProt sequences relative to a reference.
 
 ## Interpreter
-Use `/home/dzyla/miniconda3/envs/space/bin/python`.
+`.venv/bin/python` in the repository root.
 
-## Quick start
+## Quick start (Python)
 ```python
-import space_api as sa
+from space.core.pipeline import run_pipeline
+from space.core import annotate
 
-result = sa.run_pipeline(
-    query="Hendra henipavirus F",
-    email="dzyla@lji.org",
-    data_source="UniProt",
-    max_seqs=50,
-    out_dir="runs/hendra_f",
+run = run_pipeline(
+    query='"Henipavirus hendraense"[Organism] AND fusion[Title]',
+    source="NCBI", email="you@example.org", max_seqs=500,
+    min_identity=50, min_coverage=30, deletion_threshold=20,
 )
+print(run.summary())
+print(run.variants.filter(min_frequency=0.01, unique=True).head(20))
 
-# al2co conservation scores (per-residue)
-print(result["al2co_df"].head())
-
-# point-mutation table
-print(result["mutations_df"].head())
-
-# conservation summary DataFrame
-print(result["conservation_df"].head())
-
-# phylogenetic tree path (None if >200 sequences)
-print(result["tree_file"])
-
-# optional structural mapping result
-print(result["pdb_result"])
+# Known variants / features (UniProt reference)
+known = annotate.known_variants("P69905", run.reference)
+table = annotate.merge_known_variants(run.variants.summary, known)
 ```
 
-## Pipeline stages (order of execution inside `run_pipeline`)
-1. **Step 0** — `fetch_sequences`: NCBI Entrez (needs `email`) or UniProt → `sequences.fasta`.
-2. **Step 1** — `perform_alignment`: pairwise alignment to reference; compute identity/coverage.
-3. **Step 2** — `filter_sequences`: keep sequences above `filtering_score` within length range.
-4. **Step 3** — `perform_msa_pyfamsa`: pyfamsa MSA → `msa_out.fasta`; convert to CLUSTAL `.aln`.
-5. **Step 4** — `analyze_alignment` + `run_al2co`: conservation DataFrame + al2co scores.
-6. **Step 5** — `list_unique_point_mutations` + `parse_mutations`: point-mutation table.
-7. **Step 6** — `generate_phylogenetic_tree`: only if ≤ 200 sequences.
-8. **Step 7** — `map_structure` (optional): map conservation onto PDB/AlphaFold.
-
-## Key pitfalls
-- **CLUSTAL W header:** native `al2co` reads via `AlignIO.read(..., "clustal")`.
-  The MSA is converted to CLUSTAL by `_write_clustal` which normalises the header
-  to `CLUSTAL W multiple sequence alignment`. Without the proper header al2co
-  fails.
-- **Identical sequences → zero variance:** all-identical inputs produce all-NaN
-  al2co scores (zero variance). Deduplicate identical sequences beforehand.
-- **Headless stub:** `headless_streamlit.install()` registers
-  `streamlit.components.v1` so `stmol` imports work headlessly. `space_api`
-  calls `.install()` internally at import time.
-- **Email:** NCBI needs `email="dzyla@lji.org"`.
-
-## Streamlit UI
+## Command line
 ```bash
-streamlit run app.py
+python -m space run -q 'gene:HBA1 AND organism_id:9606' -s UniProt -o runs/hba
+python -m space variants runs/hba --min-frequency 0.01 --format tsv
+python -m space annotate runs/hba --uniprot P69905
 ```
 
-## Environment
-`pip install -r requirements.txt`. No reinstallation needed.
+## MCP
+`python -m space mcp` — tools `find_variants`, `get_variants`, `get_variant`,
+`annotate_run`, `map_run_to_structure`, `fetch_sample_metadata`, `variant_trend`.
+
+## Reading results
+- `Frequency` = carriers / sequences covering the position; prefer
+  `Unique frequency` when one outbreak/study dominates the database.
+- Names: `I6G`, `K5del`, `K5_Q8del`, `A4_Y5insWW` (+ HGVS `p.` column).
+- `X` is missing data, never a variant.
+
+## Pitfalls
+- Use fielded queries; free text pulls in unrelated proteins (filter with
+  `min_identity` otherwise).
+- NCBI needs an email; set `NCBI_API_KEY` for large fetches.
+- All-identical inputs give NaN al2co scores (zero variance) — expected.

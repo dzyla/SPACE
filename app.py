@@ -1,70 +1,56 @@
-# app.py
+# app.py — SPACE Streamlit front-end (all computation lives in space.core)
 
-import datetime
-import glob
+from __future__ import annotations
+
 import io
 import logging
-import os
-import platform
+import shutil
 import socket
 import time
-import traceback
 import uuid
 import zipfile
-from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
-import plotly.express as px
-import py3Dmol
-import stmol
 import streamlit as st
-from stmol import showmol
 
-from space.alignment import *
-from space.analysis import *
-from space.fetch import *
-from space.pdb_processing import *
-from space.utils import *
-from space.visualization import *
+from space import viz
+from space.core import annotate
+from space.core.align import filter_hits, pairwise_to_reference
+from space.core.conservation import logo_and_consensus
+from space.core.pipeline import SpaceRun, analyse, choose_reference, list_runs, new_run_dir
+from space.core.sequences import (extract_uniprot_accession, fetch_sequences, parse_sequence_text,
+                                  read_fasta)
+from space.core.structure import (download_alphafold, download_pdb, map_to_structure, pdb_metadata,
+                                  search_pdb)
 
-# -----------------------------------
-# Configuration
-# -----------------------------------
-
-st.set_page_config(
-    page_title="SPACE",
-    layout="wide",
-    page_icon=":stars:",
-    initial_sidebar_state="expanded",
-)
-
+st.set_page_config(page_title="SPACE · protein variant explorer", layout="wide", page_icon="🧬",
+                   initial_sidebar_state="expanded")
 logging.basicConfig(level=logging.INFO)
-
-# Guard against indefinite hangs on stalled NCBI/UniProt connections (Bio.Entrez
-# has no per-call timeout of its own) — without this, a stalled request can
-# freeze the whole session, which looks like a crash from the user's side.
+# Bio.Entrez has no per-call timeout; a stalled socket would freeze the session.
 socket.setdefaulttimeout(60)
 
-# -----------------------------------
-# Session-scoped output directory
-# -----------------------------------
 SESSIONS_ROOT = Path("sessions")
 SESSION_MAX_AGE_HOURS = 24
+FREQ_STEPS = [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5]
+EXAMPLES = [
+    ("Hendra virus F (NCBI)", "NCBI", '"Henipavirus hendraense"[Organism] AND fusion[Title]'),
+    ("SARS-CoV-2 ORF8 (NCBI)", "NCBI", '"Severe acute respiratory syndrome coronavirus 2"[Organism] AND ORF8[Gene]'),
+    ("Human TP53 orthologs (UniProt)", "UniProt", "gene:TP53 AND reviewed:true"),
+]
 
+
+# ---------------------------------------------------------------------------
+# Session plumbing
+# ---------------------------------------------------------------------------
 
 def _prune_stale_sessions(root: Path, max_age_hours: float) -> None:
-    """
-    Delete session directories older than max_age_hours. Public deployments
-    (e.g. Streamlit Community Cloud) have limited/ephemeral disk quota, and
-    session dirs are otherwise never cleaned up — left unchecked they
-    accumulate across users and can fill the disk, crashing the app.
-    """
+    """Public deployments have small, shared disks: drop session dirs older than a day."""
     if not root.exists():
         return
-    import shutil
-
     cutoff = time.time() - max_age_hours * 3600
     for entry in root.iterdir():
         try:
@@ -74,846 +60,706 @@ def _prune_stale_sessions(root: Path, max_age_hours: float) -> None:
             continue
 
 
-if "session_dir" not in st.session_state:
-    _prune_stale_sessions(SESSIONS_ROOT, SESSION_MAX_AGE_HOURS)
-    session_id = uuid.uuid4().hex
-    session_dir = SESSIONS_ROOT / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    st.session_state.session_dir = session_dir
-else:
-    session_dir = st.session_state.session_dir
+def session_dir() -> Path:
+    if "session_dir" not in st.session_state:
+        _prune_stale_sessions(SESSIONS_ROOT, SESSION_MAX_AGE_HOURS)
+        d = SESSIONS_ROOT / uuid.uuid4().hex
+        d.mkdir(parents=True, exist_ok=True)
+        st.session_state.session_dir = d.resolve()
+    return st.session_state.session_dir
 
-# Track outputs to simplify bundling at the end
-if "outputs" not in st.session_state:
-    st.session_state.outputs = set()
 
-def out_path(fname: str) -> str:
-    """
-    Create a path under the session directory, ensure parent exists,
-    and remember it for later zipping.
-    """
-    path = session_dir / fname
-    path.parent.mkdir(parents=True, exist_ok=True)
-    st.session_state.outputs.add(str(path))
-    return str(path)
+def reset(*keys: str) -> None:
+    for k in keys:
+        st.session_state.pop(k, None)
 
-def create_zip_file(file_paths: List[str], zip_name: str) -> Optional[io.BytesIO]:
-    """
-    Creates a zip file in memory from the given list of file paths.
-    """
-    if not file_paths:
-        return None
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for file_path in file_paths:
+@contextmanager
+def surfaced_warnings():
+    """Show warnings logged by space.core during a block as Streamlit warnings."""
+    messages: List[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = _Handler(level=logging.WARNING)
+    logger = logging.getLogger("space")
+    logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger.removeHandler(handler)
+        for m in dict.fromkeys(messages):
+            st.warning(m, icon="⚠️")
+
+
+def status_progress(status):
+    bar = status.progress(0.0)
+
+    def cb(fraction: float, message: str) -> None:
+        bar.progress(fraction, text=message)
+    return cb
+
+
+def is_dark() -> bool:
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def chart(fig, key: Optional[str] = None):
+    st.plotly_chart(fig, theme=None, key=key, config={"displaylogo": False})
+
+
+def pct(x: float) -> str:
+    return f"{x * 100:.1f}%" if x >= 0.001 or x == 0 else f"{x * 100:.2f}%"
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: new analysis / saved runs
+# ---------------------------------------------------------------------------
+
+def _use_example(source: str, query: str) -> None:
+    st.session_state.source_input = source
+    st.session_state.query_input = query
+
+
+def sidebar() -> None:
+    sb = st.sidebar
+    sb.markdown("### 🧬 SPACE")
+    sb.caption("Find and interpret protein variants across sequence databases.")
+    st.session_state.setdefault("source_input", "NCBI")
+    with sb.form("fetch_form"):
+        source = st.segmented_control("Database", ["NCBI", "UniProt"], key="source_input", required=True)
+        query = st.text_area(
+            "Search query", key="query_input", height=90,
+            placeholder='"Henipavirus hendraense"[Organism] AND fusion[Title]',
+            help="NCBI: Entrez syntax, e.g. `\"Influenza A virus\"[Organism] AND hemagglutinin[Title]`.\n\n"
+                 "UniProt: query syntax, e.g. `gene:TP53 AND organism_id:9606`.\n\n"
+                 "Fielded queries avoid unrelated proteins slipping in.",
+        )
+        email = st.text_input("Email (required by NCBI)", key="email_input", placeholder="you@example.org",
+                              autocomplete="email")
+        max_seqs = st.number_input("Maximum sequences (-1 = all, capped at 20,000)", min_value=-1,
+                                   value=500, step=100)
+        with st.expander("Options"):
+            refseq_only = st.checkbox("NCBI: RefSeq only")
+            remove_pdb = st.checkbox("Remove PDB-derived sequences", value=True)
+            reviewed_only = st.checkbox("UniProt: reviewed (Swiss-Prot) only")
+        submitted = st.form_submit_button("Fetch sequences", type="primary", width="stretch")
+
+    if submitted:
+        if not query.strip():
+            sb.error("Enter a search query.")
+        elif source == "NCBI" and "@" not in (email or ""):
+            sb.error("NCBI requires a valid email address.")
+        else:
+            fetch(source, query.strip(), email, int(max_seqs), refseq_only, reviewed_only, remove_pdb)
+
+    with sb.expander("…or upload a FASTA file"):
+        up = st.file_uploader("FASTA", type=["fasta", "fa", "faa", "fas", "txt"], label_visibility="collapsed")
+        if up is not None and st.button("Use uploaded sequences", width="stretch"):
+            load_uploaded_fasta(up)
+
+    runs = list_runs(session_dir() / "runs")
+    if runs:
+        sb.divider()
+        sb.markdown("**Runs in this session**")
+        labels = {r["run_id"]: f"{r['query'] or r['run_id']} · {r['created'][11:16]}" for r in runs}
+        current = st.session_state.get("run")
+        chosen = sb.selectbox("Open run", list(labels), format_func=labels.get,
+                              index=list(labels).index(current.run_id) if current and current.run_id in labels else 0,
+                              label_visibility="collapsed")
+        if current is None or chosen != current.run_id:
+            if sb.button("Open", width="stretch"):
+                st.session_state.run = SpaceRun.load(Path(next(r["run_dir"] for r in runs if r["run_id"] == chosen)))
+                reset("annotation", "metadata", "structure", "pdb_hits")
+                st.rerun()
+
+    sb.divider()
+    sb.caption("Zyla, D. **SPACE**: Sequence Protein Alignment and Conservation Engine. "
+               "Based on Zyla, D. *et al.* Science (2024) · [GitHub](https://github.com/dzyla/SPACE)")
+
+
+def fetch(source, query, email, max_seqs, refseq_only, reviewed_only, remove_pdb) -> None:
+    sdir = session_dir() / "fetch" / uuid.uuid4().hex[:8]
+    with st.status(f"Fetching from {source}…", expanded=True) as status, surfaced_warnings():
+        try:
+            path = fetch_sequences(query, sdir / "sequences.fasta", source=source, email=email,
+                                   max_seqs=max_seqs, refseq_only=refseq_only, reviewed_only=reviewed_only,
+                                   progress=status_progress(status))
+            records = read_fasta(path, remove_pdb=remove_pdb)
+        except Exception as exc:  # noqa: BLE001
+            status.update(label=f"Fetch failed: {exc}", state="error")
+            return
+        if not records:
+            status.update(label="No sequences found.", state="error")
+            return
+        status.update(label=f"Fetched {len(records)} sequences", state="complete", expanded=False)
+    reset("run", "hits", "hits_key", "annotation", "metadata", "structure", "pdb_hits")
+    st.session_state.update(records=records, fasta_path=path, fetch_params={
+        "query": query, "source": source, "email": email, "max_seqs": max_seqs,
+        "refseq_only": refseq_only, "reviewed_only": reviewed_only, "remove_pdb": remove_pdb})
+
+
+def load_uploaded_fasta(upload) -> None:
+    sdir = session_dir() / "fetch" / uuid.uuid4().hex[:8]
+    sdir.mkdir(parents=True, exist_ok=True)
+    path = sdir / "sequences.fasta"
+    path.write_bytes(upload.getbuffer())
+    try:
+        records = read_fasta(path)
+    except Exception as exc:  # noqa: BLE001
+        st.sidebar.error(f"Could not read FASTA: {exc}")
+        return
+    if len(records) < 2:
+        st.sidebar.error("The file needs at least two protein sequences.")
+        return
+    reset("run", "hits", "hits_key", "annotation", "metadata", "structure", "pdb_hits")
+    st.session_state.update(records=records, fasta_path=str(path), fetch_params={
+        "query": upload.name, "source": "FASTA", "email": st.session_state.get("email_input", ""),
+        "max_seqs": len(records), "refseq_only": False, "reviewed_only": False, "remove_pdb": False})
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Welcome
+# ---------------------------------------------------------------------------
+
+def welcome() -> None:
+    st.title("Protein variants across sequence databases")
+    st.markdown(
+        "SPACE fetches every matching sequence from **NCBI** or **UniProt**, aligns them to a "
+        "reference and reports each **substitution, insertion and deletion** with its frequency, "
+        "conservation, known-variant annotations (dbSNP, ClinVar) and position on the 3D structure."
+    )
+    c = st.columns(3)
+    for col, (label, source, query) in zip(c, EXAMPLES):
+        with col.container(border=True):
+            st.markdown(f"**{label}**")
+            st.code(query, language=None, wrap_lines=True)
+            st.button("Use this query", key=f"ex_{label}", on_click=_use_example, args=(source, query),
+                      width="stretch")
+    st.caption("Pick an example or write your own query in the sidebar, then press **Fetch sequences**.")
+    with st.expander("How frequencies are computed"):
+        st.markdown(
+            "- Each sequence only counts at positions it actually covers, so fragments add data without "
+            "diluting frequencies elsewhere.\n"
+            "- **Unique frequency** counts identical sequences once — databases often hold many copies "
+            "from one outbreak or study.\n"
+            "- `X` and other ambiguous residues are treated as missing data, never as a variant.\n"
+            "- Variant names: `I6G` (substitution), `K5del` / `K5_Q8del` (deletion), "
+            "`A4_Y5insWW` (insertion between residues 4 and 5), plus HGVS protein notation."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Setup: reference + filters
+# ---------------------------------------------------------------------------
+
+def setup_stage(dark: bool) -> None:
+    records = st.session_state.records
+    params = st.session_state.fetch_params
+    st.title("Set up the analysis")
+    st.markdown(f"{len(records)} sequences from **{params['source']}** for `{params['query']}`")
+
+    with st.container(border=True):
+        st.markdown("#### 1 · Reference sequence")
+        auto_seq, auto_id = choose_reference(records)
+        mode = st.segmented_control("Reference", ["From results", "Paste sequence"], default="From results",
+                                    required=True, label_visibility="collapsed")
+        if mode == "From results":
+            ids = [r.id for r in records]
+            desc = {r.id: f"{r.id} · {len(r.seq)} aa · {r.description[len(r.id):].strip()[:70]}" for r in records}
+            ref_id = st.selectbox("Reference record", ids, index=ids.index(auto_id) if auto_id in ids else 0,
+                                  format_func=desc.get,
+                                  help="Defaults to a curated (Swiss-Prot/RefSeq) entry or the most common "
+                                       "full-length sequence — usually the wild type.")
+            ref_seq, _ = choose_reference(records, reference_id=ref_id)
+        else:
+            ref_id = None
+            ref_seq = parse_sequence_text(st.text_area("Reference (raw or FASTA)", height=110))
+            if not ref_seq:
+                st.info("Paste a reference sequence to continue.")
+                return
+        st.caption(f"Reference length: {len(ref_seq)} aa")
+
+    key = (st.session_state.fasta_path, ref_seq)
+    if st.session_state.get("hits_key") != key:
+        with st.spinner("Aligning sequences to the reference…"), surfaced_warnings():
+            st.session_state.hits = pairwise_to_reference(records, ref_seq)
+        st.session_state.hits_key = key
+    hits: pd.DataFrame = st.session_state.hits
+
+    with st.container(border=True):
+        st.markdown("#### 2 · Choose sequences")
+        left, right = st.columns([2, 3])
+        with left:
+            lo_i, hi_i = float(hits["identity"].min()), float(hits["identity"].max())
+            identity = st.slider("Identity to reference (%)", 0.0, 100.0,
+                                 (max(0.0, np.floor(lo_i)), 100.0), 0.5,
+                                 help="Identical residues / alignment length. Low values are usually "
+                                      "other proteins that matched the query.")
+            lo_l, hi_l = int(hits["length"].min()), int(hits["length"].max())
+            length = st.slider("Length (aa)", lo_l, max(hi_l, lo_l + 1), (lo_l, max(hi_l, lo_l + 1)))
+            coverage = st.slider("Minimum coverage of the reference (%)", 0, 100, 30,
+                                 help="Fragments still count only at positions they cover.")
+            with st.expander("Advanced"):
+                deletion = st.slider("Exclude sequences with internal deletions above (%)", 0, 100, 20)
+                skip_x = st.checkbox("Treat ambiguous residues (X) as missing data", value=True)
+                tree = st.checkbox("Build phylogenetic tree", value=True)
+        selected = filter_hits(hits, identity[0], identity[1], length[0], length[1], coverage)
+        with right:
+            chart(viz.hits_density(hits, identity, length, dark=dark), key="density")
+        st.markdown(f"**{len(selected)}** of {len(hits)} sequences selected")
+        start_run = st.button("Align and call variants", type="primary", disabled=selected.empty)
+
+    if start_run:
+        run_dir = new_run_dir(params["query"], root=session_dir() / "runs")
+        (run_dir / "sequences.fasta").write_text(Path(st.session_state.fasta_path).read_text())
+        with st.status("Running analysis…", expanded=True) as status, surfaced_warnings():
             try:
-                if os.path.isfile(file_path):
-                    # Keep folder structure inside the zip relative to session_dir
-                    arcname = os.path.relpath(file_path, start=session_dir)
-                    zip_file.write(file_path, arcname=arcname)
-                else:
-                    st.warning(f"File does not exist and will be skipped: {file_path}")
-            except Exception as e:
-                st.warning(f"Failed to add {file_path} to zip: {e}")
-    zip_buffer.seek(0)
-    return zip_buffer
-
-def main():
-    st.title("Sequence Protein Alignment and Conservation Engine (SPACE) :stars:")
-    welcome = st.empty()
-
-    # Initialize session state
-    logging.info("Initializing session state variables.")
-    if "result" not in st.session_state:
-        st.session_state.update({
-            "result": None,
-            "reference_seq": None,
-            "msa_done": False,
-            "filtered": False,
-            "msa_df": None,
-            "msa_image": None,
-            "msa_letters": None,
-            "msa_outfile": None,
-            "al2co_output": None,
-            "al2co_df": None,
-            "alignment_mapping": None,
-            "unique_mutations": {},
-            "excluded_sequences": {},
-            "mutation_summary": set(),
-            "all_mutations_str": "",
-            "proteins_list": None,
-            "phylogenetic_tree": None,
-            "user_pdb": None,
-            "show_msa": False,
-        })
-
-    # Intro text shown only before results exist
-    if st.session_state.get("result") is None:
-        welcome.markdown(
-            """
-Welcome to **Sequence Protein Alignment and Conservation Engine (SPACE)**, a tool for exploring
-and understanding protein sequences and their conservation in 2D and 3D.
-
-## Description
-
-- **Fetch Protein Sequences:** Retrieve protein sequences from databases like **NCBI** and **UniProt**.
-- **Reference Sequence Selection:** Choose or provide a reference sequence for alignment.
-- **Pairwise Alignment:** Filter sequences by alignment score.
-- **Multiple Sequence Alignment (MSA):** Perform and visualize alignments with **pyfamsa**.
-- **Conservation Scoring:** Assess conservation using AL2CO.
-- **Mutation Analysis:** Identify unique point mutations.
-- **Phylogenetic Tree Generation:** Visualize evolutionary relationships.
-- **Structural Mapping:** Map conservation scores onto 3D structures.
-- **Download Results:** Bundle all outputs in a ZIP.
-
-## How to cite
-
-- Zyla, D. **SPACE**: Sequence Protein Alignment and Conservation Engine. Streamlit app.
-- Based on Zyla, D. et al. *Science*(2024). DOI:10.1126/science.adm8693
-"""
-        )
-    else:
-        welcome.empty()
-
-    logging.info(f"Session folder: {session_dir}")
-
-    # -----------------------------------
-    # Sidebar inputs
-    # -----------------------------------
-    st.sidebar.header("Parameters")
-    with st.sidebar.form("parameters_form"):
-        email = st.text_input(
-            "Enter your email for NCBI Entrez:",
-            value="",
-            help="Required for accessing NCBI databases.",
-            autocomplete="email",
-            placeholder="you@example.com",
-        )
-        data_source = st.selectbox("Select data source:", ["NCBI", "UniProt"])
-        st.info('Check the query hits [here](https://www.ncbi.nlm.nih.gov/protein/)')
-        query = st.text_input("Enter your query:", "Hendra henipavirus F")
-        sc1, sc2 = st.columns(2)
-        use_refseq = sc1.checkbox("Use RefSeq database", value=False)
-        remove_PDB = sc2.checkbox("Remove PDB entries from MSA", value=False)
-        max_seqs = st.number_input(
-            "Enter maximum number of sequences to fetch (-1 for all):",
-            min_value=-1,
-            value=100,
-            step=1,
-        )
-
-
-
-        submit_button = st.form_submit_button(label="Fetch Sequences")
-
-    # -----------------------------------
-    # Step 1: Fetch sequences
-    # -----------------------------------
-    if submit_button:
-        if data_source == "NCBI" and not email:
-            st.sidebar.error("Email is required for NCBI Entrez access.")
-        else:
-            welcome.empty()
-            try:
-                fasta_path = out_path("msa/sequences.fasta")
-                with st.spinner("Fetching sequences..."):
-                    if data_source == "NCBI":
-                        file_path = search_and_save_protein_ncbi(
-                            query,
-                            fasta_path,
-                            email,
-                            max_seqs=max_seqs,
-                            use_refseq=use_refseq,
-                        )
-                    else:
-                        file_path = search_and_save_protein_uniprot(
-                            query, fasta_path, max_seqs=max_seqs
-                        )
-
-                if file_path:
-                    proteins_list = get_protein_sequences(
-                        file_path, remove_PDB=remove_PDB
-                    )
-                    st.session_state.proteins_list = proteins_list
-                    # Reset downstream state
-                    for key in [
-                        "result", "reference_seq", "msa_done", "filtered",
-                        "msa_df", "msa_image", "msa_letters", "msa_outfile",
-                        "al2co_output", "al2co_df", "alignment_mapping",
-                        "unique_mutations", "excluded_sequences",
-                        "mutation_summary", "all_mutations_str",
-                        "phylogenetic_tree"
-                    ]:
-                        if key == "msa_done":
-                            st.session_state[key] = False
-                        elif key in ["unique_mutations", "excluded_sequences"]:
-                            st.session_state[key] = {}
-                        elif key == "mutation_summary":
-                            st.session_state[key] = set()
-                        elif key == "all_mutations_str":
-                            st.session_state[key] = ""
-                        else:
-                            st.session_state[key] = None
-                    #st.success("Sequences fetched and saved successfully.")
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
-                st.error(traceback.format_exc())
-
-    # -----------------------------------
-    # Step 2: Reference Sequence Selection
-    # -----------------------------------
-    if st.session_state.get("proteins_list") and not st.session_state.get("msa_done"):
-        ref_seq_choice = st.radio(
-            "Select reference sequence:",
-            ["Select from list", "Use provided sequence"],
-            horizontal=True,
-        )
-
-        if ref_seq_choice == "Select from list":
-            st.header("Select Reference Sequence")
-            sorted_protein_list = sorted(
-                st.session_state.proteins_list, key=lambda seq: seq.id
-            )
-            seq_options = [
-                f"{seq.id} (Length: {len(seq.seq)})" for seq in sorted_protein_list
-            ][::-1]
-            sorted_protein_list = sorted_protein_list[::-1]
-
-            selected_seq = st.selectbox("Select Reference Sequence:", seq_options)
-            if selected_seq:
-                idx = seq_options.index(selected_seq)
-                st.session_state.reference_seq = str(
-                    sorted_protein_list[idx].seq
-                ).upper()
-                #st.success("Reference sequence selected.")
-        else:
-            st.header("Provide Reference Sequence")
-            ref = st.text_area(
-                "Enter the reference sequence (1-letter code):", height=200
-            ).strip().upper()
-            cleaned = clean_fasta(ref)
-            st.session_state.reference_seq = cleaned
-            if cleaned:
-                st.success("Reference sequence provided.")
-
-        c1, c2 = st.columns(2)
-        if c1.button("Start Alignment") and st.session_state.get("reference_seq"):
-            with st.spinner("Performing pairwise alignments..."):
-                try:
-                    result, reference_seq = perform_alignment(
-                        st.session_state.proteins_list,
-                        st.session_state.reference_seq,
-                    )
-                    st.session_state.result = result
-                    st.session_state.reference_seq = reference_seq
-                    # Reset downstream
-                    for key in [
-                        "msa_done", "filtered", "msa_df", "msa_image",
-                        "msa_letters", "msa_outfile", "al2co_output",
-                        "al2co_df", "phylogenetic_tree"
-                    ]:
-                        if key == "msa_done":
-                            st.session_state[key] = False
-                        else:
-                            st.session_state[key] = None
-                except Exception as e:
-                    st.error(f"An error occurred during alignment: {e}")
-                    st.error(traceback.format_exc())
-
-    # -----------------------------------
-    # Step 3: Filter & MSA (pyfamsa)
-    # -----------------------------------
-    if st.session_state.get("result") and not st.session_state.get("msa_done"):
-        st.header("Filter Sequences")
-        with st.form("Adjust Filtering Parameters"):
-            st.subheader("Filter Parameters")
-            all_scores = st.session_state.result[0]
-            all_seq_lengths = [len(seq) for seq in st.session_state.result[1]]
-            min_score = min(all_scores) if all_scores else 0
-            max_score = max(all_scores) if all_scores else 1000
-            min_seq_length = min(all_seq_lengths) if all_seq_lengths else 0
-            max_seq_length = max(all_seq_lengths) if all_seq_lengths else 1000
-            c1, c2 = st.columns(2)
-            score_range = c1.slider(
-                "Select alignment score range:",
-                min_value=float(min_score),
-                max_value=float(max_score),
-                value=(float(min_score), float(max_score)),
-            )
-            seq_len_range = c2.slider(
-                "Select sequence length range:",
-                min_value=min_seq_length,
-                max_value=max_seq_length,
-                value=(min_seq_length, max_seq_length),
-            )
-
-            st.markdown("---")
-            st.subheader("Fasta sequence filtering")
-            st.write(
-                "Filtering sequences based on sequence length and alignment score."
-            )
-            visualize_hexbin_plot(
-                st.session_state.result,
-                score_limit=score_range[0],
-                score_max=score_range[1],
-                seq_min=seq_len_range[0],
-                seq_max=seq_len_range[1],
-            )
-
-            continue_button = st.form_submit_button("Continue with Alignment")
-
-        if continue_button:
-            with st.spinner("Filtering sequences and performing MSA (pyfamsa)..."):
-                try:
-                    high_score_seqs, id_array_selected, scores_final = filter_sequences(
-                        st.session_state.result,
-                        filtering_score=score_range[0],
-                        score_max=score_range[1],
-                        sequence_len_min=seq_len_range[0],
-                        sequence_len_max=seq_len_range[1],
-                    )
-                    st.write(
-                        f"After filtering, **{len(high_score_seqs)}** sequences will be used for MSA."
-                    )
-                    if high_score_seqs:
-                        msa_infile = out_path("msa/msa_in.fasta")
-                        msa_outfile = out_path("msa/msa_out.fasta")
-
-                        # NEW: pyfamsa-based MSA call (no clustal path)
-                        max_threads = min(os.cpu_count() or 4, 16)
-                        msa_outfile = perform_msa_pyfamsa(
-                            high_score_seqs,
-                            id_array_selected,
-                            st.session_state.reference_seq,
-                            msa_infile,
-                            msa_outfile,
-                            threads=max_threads,
-                        )
-
-                        if msa_outfile:
-                            aln_file = msa_outfile.replace(".fasta", ".aln")
-                            if os.path.exists(aln_file):
-                                st.session_state.outputs.add(aln_file)
-
-                            msa_image, msa_letters = msa_to_image(aln_file)
-                            st.session_state.msa_done = True
-                            st.session_state.msa_image = msa_image
-                            st.session_state.msa_letters = msa_letters
-                            st.session_state.msa_outfile = msa_outfile
-
-                            st.session_state.msa_df = analyze_alignment(
-                                aln_file,
-                                st.session_state.reference_seq,
-                            )
-
-                            # Run al2co
-                            st.session_state.al2co_df = run_al2co(aln_file)
-                            st.session_state.al2co_output = "computed"
-
-                            # Identify point mutations
-                            (
-                                unique_mutations,
-                                excluded_sequences,
-                                excluded_count,
-                                mutation_summary,
-                                all_mutations_str,
-                            ) = list_unique_point_mutations(
-                                aln_file,
-                                "reference_sequence",
-                                st.session_state.alignment_mapping,
-                                deletion_threshold=10,
-                                exclude_mutations_with_X=True,
-                            )
-                            st.session_state.unique_mutations = unique_mutations
-                            st.session_state.excluded_sequences = excluded_sequences
-                            st.session_state.mutation_summary = mutation_summary
-                            st.session_state.all_mutations_str = all_mutations_str
-                            st.session_state.phylogenetic_tree = None
-                except Exception as e:
-                    st.error(f"An error occurred during filtering and MSA: {e}")
-                    st.error(traceback.format_exc())
-
-    # -----------------------------------
-    # Step 4: Display MSA & Conservation
-    # -----------------------------------
-    if st.session_state.get("msa_done"):
-        try:
-            show_msa = st.checkbox("Show MSA", value=st.session_state.show_msa)
-            st.session_state.show_msa = show_msa
-            if show_msa:
-                # Save the figure under the session folder (handled inside)
-                plot_msa_image(
-                    st.session_state.msa_image, st.session_state.msa_letters,
-                    folder=str(session_dir / "msa")
-                )
-        except Exception as e:
-            st.error(f"An error occurred while plotting MSA image: {e}")
-            st.error(traceback.format_exc())
-
-        if st.session_state.get("al2co_df") is not None:
-            st.header("Conservation Scoring with al2co")
-            st.subheader("Conservation Scores from al2co")
-            choice = st.selectbox(
-                "Select plot type for al2co conservation scores:",
-                ["Plotly", "Seaborn"],
-            )
-            if choice == "Seaborn":
-                visualize_al2co_seaborn(st.session_state.al2co_df, str(session_dir / "al2co"))
-            else:
-                visualize_al2co_plotly(st.session_state.al2co_df, str(session_dir / "al2co"))
-
-            st.subheader("Sequence Logo and Consensus")
-            identity_threshold = st.slider(
-                "Consensus Identity Threshold (%)",
-                min_value=0.0, max_value=100.0, value=60.0, step=0.5,
-                help="Positions where the most frequent amino acid falls below this threshold will be shown as 'X' in the consensus sequence."
-            )
-
-            if st.session_state.get("msa_outfile") and st.session_state.get("alignment_mapping"):
-                visualize_logo_and_consensus(
-                    st.session_state.msa_outfile,
-                    st.session_state.alignment_mapping,
-                    identity_threshold / 100.0,
-                    str(session_dir / "al2co")
-                )
-
-    # -----------------------------------
-    # Point Mutations Analysis
-    # -----------------------------------
-    if st.session_state.get("unique_mutations"):
-        st.header("Point Mutations Analysis")
-
-        # Unique mutations per sequence table
-        st.subheader("Unique Mutations Per Sequence")
-        muts_df = pd.DataFrame(
-            list(st.session_state.unique_mutations.items()),
-            columns=["Sequence ID", "Mutations"],
-        )
-        muts_df["Mutation Count"] = muts_df["Mutations"].apply(
-            lambda m: 0 if m == "No mutations" else len(m.split(", "))
-        )
-        muts_df = muts_df.sort_values("Mutation Count", ascending=False).reset_index(drop=True)
-        st.dataframe(
-            muts_df,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Sequence ID": st.column_config.TextColumn(width="medium"),
-                "Mutations": st.column_config.TextColumn(width="large"),
-                "Mutation Count": st.column_config.NumberColumn(
-                    "# Mutations", help="Number of point mutations vs. the reference sequence"
-                ),
-            },
-        )
-
-        # Save CSVs
-        muts_export = get_mutation_dataframe()
-        if not muts_export.empty:
-            csv1 = out_path("tables/point_mutations.tsv")
-            muts_export.to_csv(csv1, index=False, sep="\t")
-        unique_muts_df = muts_export.drop_duplicates(subset=["Mutation"])
-        if not unique_muts_df.empty:
-            csv2 = out_path("tables/unique_point_mutations.csv")
-            unique_muts_df.to_csv(csv2, index=False)
-
-        # All unique mutations: sortable summary table (Mutation, Count, Frequency)
-        st.subheader("All Unique Point Mutations")
-        if not muts_export.empty:
-            summary_counts = muts_export["Mutation"].value_counts().reset_index()
-            summary_counts.columns = ["Mutation", "Count"]
-            n_sequences = st.session_state.msa_image.shape[0]
-            summary_counts["Frequency"] = summary_counts["Count"] / n_sequences
-            summary_counts["Position"] = summary_counts["Mutation"].str.extract(r"(\d+)").astype(int)
-            summary_counts = summary_counts.sort_values("Count", ascending=False).reset_index(drop=True)
-
-            st.dataframe(
-                summary_counts[["Mutation", "Position", "Count", "Frequency"]],
-                hide_index=True,
-                use_container_width=True,
-                height=250,
-                column_config={
-                    "Frequency": st.column_config.ProgressColumn(
-                        "Frequency (%)", format="%.1f%%", min_value=0.0, max_value=1.0
-                    ),
-                },
-            )
-            with st.expander(f"Copy as plain text ({len(summary_counts)} mutations)"):
-                st.text_area(
-                    "All unique mutations",
-                    value=st.session_state.all_mutations_str,
-                    height=100,
-                    label_visibility="collapsed",
-                )
-        else:
-            st.write("No mutations to display.")
-
-        c1, c2 = st.columns(2)
-
-        # Switchable histogram plots
-        c1.subheader("Mutation Frequency Analysis")
-        plot_type = c1.radio(
-            "Select plot type:",
-            ["Mutation frequency histogram", "Mutations per residue index"],
-            horizontal=True,
-        )
-
-        if plot_type == "Mutation frequency histogram":
-            # Compute mutation counts, sorted so the most frequent mutation reads first
-            counts = muts_export["Mutation"].value_counts().reset_index()
-            counts.columns = ["Mutation", "Count"]
-
-            # Show the mutation counts as a fraction of all sequences
-            max_count = st.session_state.msa_image.shape[0]
-            counts["Count"] = counts["Count"] / max_count * 100
-            counts = counts.sort_values("Count", ascending=False)
-            fig = px.bar(
-                counts,
-                x="Mutation",
-                y="Count",
-                title="Frequency of Each Point Mutation",
-                labels={"Count": "Frequency (%)"},
-            )
-            fig.update_traces(marker_color=SEQUENTIAL_BLUE_ACCENT, hovertemplate="%{x}<br>Frequency: %{y:.1f}%<extra></extra>")
-            fig.update_layout(
-                plot_bgcolor='#fcfcfb',
-                xaxis=dict(showgrid=False),
-                yaxis=dict(showgrid=True, gridcolor='#e1e0d9', zeroline=False),
-            )
-            c1.plotly_chart(fig, use_container_width=True)
-        else:
-            # Compute unique mutation types per residue index
-            unique_muts_df["Index"] = unique_muts_df["Mutation"].str.extract(r"(\d+)").astype(int)
-            idx_counts = (
-                unique_muts_df.groupby("Index")
-                .size()
-                .reset_index(name="Unique Mutations Count")
-            )
-            fig = px.bar(
-                idx_counts,
-                x="Index",
-                y="Unique Mutations Count",
-                title="Unique Mutation Types per Residue Index",
-            )
-            fig.update_traces(marker_color=SEQUENTIAL_BLUE_ACCENT, hovertemplate="Position %{x}<br>%{y} mutation types<extra></extra>")
-            fig.update_layout(
-                plot_bgcolor='#fcfcfb',
-                xaxis=dict(showgrid=False, title="Residue Position"),
-                yaxis=dict(showgrid=True, gridcolor='#e1e0d9', zeroline=False),
-            )
-            c1.plotly_chart(fig, use_container_width=True)
-
-        # Phylogenetic Tree
-        c2.subheader("Phylogenetic Tree")
-        if st.session_state.get("phylogenetic_tree") is None:
-            seq_count = len(st.session_state.result[0])
-            if seq_count <= 200:
-                tree_file = generate_phylogenetic_tree(
-                    st.session_state.msa_outfile,
-                    folder=str(session_dir / "tree")
-                )
-                if tree_file:
-                    st.session_state.phylogenetic_tree = tree_file
-                    plot_phylogenetic_tree(tree_file, c2)
-                else:
-                    c2.warning("Phylogenetic tree could not be generated.")
-            else:
-                c2.warning(
-                    f"Automatic tree generation disabled for >200 sequences (current: {seq_count})."
-                )
-                if c2.checkbox("Generate tree (fast)"):
-                    tree_file = generate_phylogenetic_tree(
-                        st.session_state.msa_outfile,
-                        use_random_subsample=False,
-                        folder=str(session_dir / "tree")
-                    )
-                    if tree_file:
-                        st.session_state.phylogenetic_tree = tree_file
-                        plot_phylogenetic_tree(tree_file, c2)
-        else:
-            plot_phylogenetic_tree(st.session_state.phylogenetic_tree, c2)
-
-    # -----------------------------------
-    # Structural Mapping
-    # -----------------------------------
-    st.header("Structural Mapping of the AL2CO Score")
-    if st.session_state.get("msa_done") and st.session_state.get("al2co_output"):
-        pdb_server = st.radio(
-            "Select PDB source:",
-            ["PDB", "AlphaFold", "Upload Your Own PDB"],
-            horizontal=True,
-        )
-        sequence_score = 0.9
-        uniprot_id = None
-        uploaded = None
-
-        frequency_threshold = st.slider(
-            "Mutation Frequency Threshold for Annotation",
-            0.0, 1.0, 0.1, 0.01,
-            help="Adjust to filter displayed mutation annotations based on their frequency."
-        )
-
-        if pdb_server == "PDB":
-            pass
-        elif pdb_server == "AlphaFold":
-            sequence_score = 1.0
-            uniprot_ids = extract_uniprot_ids(
-                muts_df["Sequence ID"].tolist(), include_version=False
-            )
-            if uniprot_ids:
-                if len(uniprot_ids) > 1:
-                    names = []
-                    for uid in uniprot_ids:
-                        meta = get_protein_data(uid)
-                        if meta:
-                            name = (
-                                meta["proteinDescription"]["recommendedName"]["fullName"]["value"]
-                            )
-                            names.append(f"{uid} - {name}")
-                    sel = st.selectbox("Select UniProt ID:", names)
-                    idx = names.index(sel)
-                    uniprot_id = uniprot_ids[idx]
-                else:
-                    uniprot_id = uniprot_ids[0]
-            else:
-                st.warning("No UniProt ID found.")
-        else:
-            uploaded = st.file_uploader("Upload Your Own PDB File:", type=["pdb", "ent"])
-            if uploaded:
-                pdb_file = out_path("pdb/uploaded_structure.pdb")
-                with open(pdb_file, "wb") as f:
-                    f.write(uploaded.getbuffer())
-                st.success("PDB file uploaded.")
-                uniprot_id = None
-            else:
-                st.warning("Please upload a PDB file.")
-                uniprot_id = None
-
-
-        try:
-            c1, c2 = st.columns([1, 2])
-            c11, c12 = c1.columns(2)
-            with st.spinner("Processing PDB Chains..."):
-                if pdb_server == "Upload Your Own PDB" and uploaded:
-                    result = process_pdb_chain(
-                        seq=st.session_state.reference_seq,
-                        al2co_score=st.session_state.al2co_df,
-                        frequency_threshold=frequency_threshold,
-                        own_pdb=pdb_file,
-                        st_column=c11,
-                        save_dir=str(session_dir / "pdb"),
-                    )
-                else:
-                    result = process_pdb_chain(
-                        seq=st.session_state.reference_seq,
-                        al2co_score=st.session_state.al2co_df,
-                        sequence_score=sequence_score,
-                        frequency_threshold=frequency_threshold,
-                        uniprot_id=uniprot_id,
-                        st_column=c11,
-                        save_dir=str(session_dir / "pdb"),
-                    )
-
-            # Metadata
-            md = result["metadata"]
-            metadata_df = pd.DataFrame(
-                {
-                    "Field": ["PDB ID", "Title", "Authors", "Deposition date"],
-                    "Value": [md['pdb_id'], md['title'], md['authors'], md['date']],
-                }
-            )
-            c1.dataframe(
-                metadata_df,
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "Field": st.column_config.TextColumn(width="small"),
-                    "Value": st.column_config.TextColumn(width="large"),
-                },
-            )
-
-            chain_ids = list(result["chain_data"].keys())
-
-            # Find the best chain
-            best_chain = max(
-                chain_ids,
-                key=lambda x: result["chain_data"][x]["alignment_score"],
-            )
-
-            with c12.form("chain_selection_form"):
-                selected_chains = st.multiselect(
-                    "Select chains to display",
-                    options=chain_ids,
-                    default=[best_chain]
-                )
-                submit_chains = st.form_submit_button("Update Visualization")
-
-            if submit_chains:
-                pass # The re-run will capture the new selected_chains
-
-            if not selected_chains:
-                st.warning("Please select at least one chain to visualize.")
-            else:
-                for chain in selected_chains:
-                    score = result["chain_data"][chain]["alignment_score"]
-                    matched_len = result["chain_data"][chain]["matched_length"]
-                    c1.write(f"Chain `{chain}` (Score: {score})")
-
-                    # We compare score to matched_len instead of total reference length
-                    # to prevent penalizing perfect subset fragment alignments.
-                    if matched_len > 0 and score < matched_len * 0.2:
-                        c1.warning(f"Low alignment score for chain {chain}; consider another chain.")
-
-                # We show the alignment details only for the primary (first selected) chain
-                primary_chain = selected_chains[0]
-                primary_chain_data = result["chain_data"][primary_chain]
-                c1.subheader(f"Pairwise Sequence Alignment ({primary_chain})")
-                with c1.expander("Show Alignment Details"):
-                    st.code(primary_chain_data["alignment"])
-
-                # 3D visualization
-                c2.write("### Selected Chain Visualization")
-                xyzview = py3Dmol.view()
-
-                c3, c4 = c2.columns(2)
-                annotate = c3.checkbox("Show Annotation")
-                style = c4.radio("Select Style", ["Stick", "Sphere", "Cartoon"]).lower()
-
-                color_list = ["#ff2600", "#ffc04d", "#deddda"]
-
-                for i, chain in enumerate(selected_chains):
-                    chain_data = result["chain_data"][chain]
-                    pdb_str = open(chain_data["updated_pdb_path"], "r").read()
-
-                    # Add model for each chain, keep track of the model instance index
-                    xyzview.addModel(pdb_str, "pdb")
-
-                    scores = sorted(set(chain_data["residue_score_map"].values()))
-                    if not scores:
-                        continue
-
-                    num_colors = len(scores)
-                    counter = Counter(chain_data["residue_score_map"].values())
-                    max_freq = max(counter.values())
-                    less_freq = [
-                        val for val, cnt in counter.items()
-                        if cnt < frequency_threshold * max_freq and val != max(scores)
-                    ]
-                    annotation_residues = [
-                        (k, v) for k, v in chain_data["residue_score_map"].items()
-                        if v in less_freq
-                    ]
-                    gradient = generate_custom_gradient(color_list, num_colors)
-                    grad_dict = dict(zip(scores, gradient))
-
-                    xyzview.setStyle({'model': i}, {
-                        "cartoon": {
-                            "colorscheme": {
-                                "prop": "b",
-                                "gradient": "linear",
-                                "colors": color_list,
-                                "min": min(scores),
-                                "max": max(scores),
-                            }
-                        }
-                    })
-
-                    for res_num, score in annotation_residues:
-                        idx = int(res_num)
-                        col = grad_dict.get(score, "#deddda")
-                        if annotate:
-                            xyzview.addLabel(
-                                str(idx),
-                                {"fontOpacity": 1, "fontColor": "black", "backgroundColor": col},
-                                {"model": i, "resi": idx},
-                            )
-                        xyzview.addStyle(
-                            {"model": i, "resi": idx},
-                            {style: {"color": col}},
-                        )
-
-                xyzview.zoomTo()
-                with c2:
-                    showmol(xyzview, width=1000, height=500)
-
-        except Exception as e:
-            st.error(f"An error occurred during PDB processing: {e}")
-            st.error(traceback.format_exc())
-
-    # -----------------------------------
-    # Download Results
-    # -----------------------------------
-    if st.session_state.get("msa_done"):
-        st.header("Download Results")
-        summary_path = out_path(f"summary/{clean_string_for_path(query)}.txt")
-        try:
-            with open(summary_path, "w") as f:
-                f.write(f"Query: {query}\n")
-                f.write(f"Number of sequences fetched: {len(st.session_state.proteins_list)}\n")
-                f.write(f"Run at: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
-        except Exception as e:
-            st.warning(f"Could not write summary: {e}")
-
-        # Gather session files recursively
-        all_files = [str(p) for p in Path(session_dir).rglob("*") if p.is_file()]
-        # Include anything tracked explicitly
-        all_files = sorted(set(all_files).union(st.session_state.outputs))
-
-        # file name
-        filename = f"analysis_{clean_string_for_path(query)}.zip"
-
-        zip_buffer = create_zip_file(all_files, filename)
-        if zip_buffer:
-            st.download_button(
-                label="Download All Results as Zip",
-                data=zip_buffer,
-                file_name=filename,
-                mime="application/zip",
-                key="download_zip",
-            )
-        else:
-            st.info("No files available for download.")
-
-    # -----------------------------------
-    # Rerun Alignment & Session Utilities
-    # -----------------------------------
-    st.sidebar.header("Rerun Pairwise Alignment")
-    if st.sidebar.button("Redo Alignment"):
-        for key in [
-            "msa_done", "filtered", "msa_df", "msa_image", "msa_letters",
-            "msa_outfile", "al2co_output", "al2co_df", "unique_mutations",
-            "excluded_sequences", "mutation_summary", "all_mutations_str",
-            "phylogenetic_tree"
-        ]:
-            if key == "msa_done":
-                st.session_state[key] = False
-            elif key in ["unique_mutations", "excluded_sequences"]:
-                st.session_state[key] = {}
-            elif key == "mutation_summary":
-                st.session_state[key] = set()
-            elif key == "all_mutations_str":
-                st.session_state[key] = ""
-            else:
-                st.session_state[key] = None
-        st.success("Alignment reset.")
+                run = analyse(
+                    selected, ref_seq, run_dir, reference_id=ref_id,
+                    params={**params, "min_identity": identity[0], "max_identity": identity[1],
+                            "min_length": length[0], "max_length": length[1]},
+                    deletion_threshold=deletion, min_coverage=coverage, skip_ambiguous=skip_x,
+                    build_phylo=tree, progress=status_progress(status))
+                run.hits = hits
+                run.files["sequences"] = str(run_dir / "sequences.fasta")
+                run.save()
+            except Exception as exc:  # noqa: BLE001
+                status.update(label=f"Analysis failed: {exc}", state="error")
+                return
+            status.update(label="Analysis complete", state="complete", expanded=False)
+        reset("annotation", "metadata", "structure", "pdb_hits")
+        st.session_state.run = run
         st.rerun()
 
-    with st.sidebar.expander("Session utilities"):
-        c1, c2 = st.columns(2)
-        if c1.button("Clear this session state"):
-            st.session_state.clear()
-            st.rerun()
-        if c2.button("Delete session folder on disk"):
-            import shutil
-            shutil.rmtree(session_dir, ignore_errors=True)
-            st.success("Session folder deleted. You may refresh the app.")
 
-    st.sidebar.markdown(
-        """
-Developed by [Dawid Zyla](mailto:dzyla@lji.org)
-Source code: [GitHub](https://github.com/dzyla/SPACE)
-"""
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
+
+def reference_accession(run: SpaceRun) -> str:
+    if run.reference_id:
+        acc = extract_uniprot_accession(run.reference_id)
+        if acc:
+            return acc
+    return ""
+
+
+def annotated_summary(run: SpaceRun) -> pd.DataFrame:
+    s = run.variants.summary
+    ann = st.session_state.get("annotation")
+    if ann:
+        s = annotate.merge_known_variants(s, ann["known"])
+        s = annotate.add_feature_overlaps(s, ann["features"])
+    sm = st.session_state.get("structure")
+    if sm:
+        s = annotate.add_structure_context(s, sm.chains[sm.best_chain])
+    return s
+
+
+def results(run: SpaceRun, dark: bool) -> None:
+    info = run.summary()
+    head, actions = st.columns([5, 1])
+    head.title("Variant report")
+    head.markdown(f"`{info['query'] or run.run_id}` · reference **{run.reference_id or 'user sequence'}** "
+                  f"({len(run.reference)} aa) · {info['source']}")
+    if actions.button("New analysis", width="stretch"):
+        reset("run")
+        st.rerun()
+
+    m = st.columns(5)
+    m[0].metric("Sequences analysed", info["sequences_analysed"],
+                help=f"{info['sequences_excluded']} excluded (see Sequences tab)")
+    m[1].metric("Unique sequences", info["unique_sequences"])
+    m[2].metric("Distinct variants", info["distinct_variants"])
+    m[3].metric("Variable positions", info["variant_positions"])
+    m[4].metric("Variants ≥ 1%", info["variants_ge_1pct"])
+
+    tabs = st.tabs(["Variants", "Conservation", "Structure", "Alignment & tree", "Sequences", "Export"])
+    with tabs[0]:
+        selected = variants_tab(run, dark)
+    with tabs[1]:
+        conservation_tab(run, dark)
+    with tabs[2]:
+        structure_tab(run, selected, dark)
+    with tabs[3]:
+        alignment_tab(run, selected, dark)
+    with tabs[4]:
+        sequences_tab(run)
+    with tabs[5]:
+        export_tab(run)
+
+
+def variants_tab(run: SpaceRun, dark: bool) -> List[str]:
+    summary = annotated_summary(run)
+    positions = run.positions
+    if summary.empty:
+        st.info("No variants: every analysed sequence matches the reference where it is covered.")
+        return []
+
+    c = st.columns([3, 2, 3, 1.4])
+    basis = c[0].segmented_control("Count", ["All sequences", "Unique sequences"], default="All sequences",
+                                   required=True, help="Unique: identical sequences counted once.")
+    unique = basis == "Unique sequences"
+    min_freq = c[1].select_slider("Minimum frequency", FREQ_STEPS, value=0.0, format_func=pct)
+    types = c[2].pills("Type", ["Substitution", "Insertion", "Deletion"], selection_mode="multi",
+                       default=["Substitution", "Insertion", "Deletion"])
+    log_y = c[3].toggle("Log scale", value=True)
+    L = len(run.reference)
+    span = st.slider("Position range", 1, L, (1, L)) if L > 1 else (1, 1)
+
+    freq_col = "Unique frequency" if unique else "Frequency"
+    view = summary[
+        (summary[freq_col] >= min_freq) & summary["Type"].isin(types or [])
+        & summary["Position"].between(*span)
+    ].sort_values([freq_col, "Position"], ascending=[False, True]).reset_index(drop=True)
+
+    # Selections are row indices into the rendered table, so the widget key
+    # includes the filter state: changing filters starts a fresh selection
+    # instead of silently pointing at different mutations.
+    table_key = "variant_table_" + uuid.uuid5(uuid.NAMESPACE_OID, repr(
+        (run.run_id, unique, min_freq, tuple(types or []), tuple(span), tuple(summary.columns)))).hex[:12]
+    sel_state = st.session_state.get(table_key)
+    rows = list(sel_state.selection.rows) if sel_state and sel_state.selection else []
+    selected = [view.loc[i, "Mutation"] for i in rows if i < len(view)]
+
+    ann = st.session_state.get("annotation")
+    feats = ann["features"] if ann else None
+    chart(viz.variant_landscape(view, positions[positions["Position"].between(*span)], features=feats,
+                                unique=unique, log_y=log_y, highlight=selected, dark=dark), key="landscape")
+    st.caption("Stems show the most frequent variant at each position; the strip below is al2co "
+               "conservation (dark = conserved). Select table rows to highlight variants everywhere.")
+
+    cols = ["Mutation", "HGVS", "Type", "Position", "Count", "Covering", "Frequency", "Unique carriers",
+            "Unique frequency", "BLOSUM62", "Change"]
+    extra = [c for c in ("Known", "Clinical significance", "dbSNP", "SIFT", "PolyPhen", "Features",
+                         "Exposure", "RSA", "B-factor / pLDDT") if c in view]
+    st.dataframe(
+        view[cols + extra], key=table_key, on_select="rerun", selection_mode="multi-row",
+        hide_index=True, height=420,
+        column_config={
+            "Frequency": st.column_config.ProgressColumn("Frequency", format="percent", min_value=0, max_value=1),
+            "Unique frequency": st.column_config.ProgressColumn("Unique freq.", format="percent",
+                                                                min_value=0, max_value=1),
+            "Covering": st.column_config.NumberColumn(help="Sequences covering this position"),
+            "BLOSUM62": st.column_config.NumberColumn(format="%d", help="Substitution score; negative = unusual"),
+            "RSA": st.column_config.NumberColumn(format="%.2f", help="Relative solvent accessibility"),
+            "Known": st.column_config.CheckboxColumn(help="Reported in the EBI Proteins variation API"),
+        },
     )
+    st.caption(f"{len(view)} variants shown · select rows for details, structure and tree highlighting")
+
+    if selected:
+        variant_detail(run, summary, selected, dark)
+
+    left, right = st.columns(2)
+    with left.container(border=True):
+        st.markdown("**Known variants & features (UniProt)**")
+        acc = st.text_input("UniProt accession of the reference", value=reference_accession(run),
+                            placeholder="e.g. P04637", key="annot_acc")
+        if st.button("Annotate", disabled=not acc):
+            with st.spinner("Querying UniProt and the EBI Proteins API…"), surfaced_warnings():
+                try:
+                    st.session_state.annotation = {
+                        "accession": acc,
+                        "features": annotate.uniprot_features(acc, run.reference),
+                        "known": annotate.known_variants(acc, run.reference),
+                    }
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Annotation failed: {exc}")
+        if ann:
+            known = summary["Known"].sum() if "Known" in summary else 0
+            st.caption(f"{ann['accession']}: {len(ann['features'])} features, {len(ann['known'])} known "
+                       f"single-residue variants; {known} of your variants are already reported.")
+    with right.container(border=True):
+        st.markdown("**Sample metadata (GenBank)**")
+        meta = st.session_state.get("metadata")
+        email = (st.session_state.get("fetch_params") or {}).get("email") or run.params.get("email")
+        if run.params.get("source") != "NCBI":
+            st.caption("Host, country and collection date are available for NCBI runs.")
+        elif st.button("Fetch host / country / collection date", disabled=not email):
+            with st.spinner("Downloading GenBank records…"), surfaced_warnings():
+                st.session_state.metadata = annotate.ncbi_source_metadata(list(run.selected["id"]), email)
+                st.rerun()
+        if meta is not None and not meta.empty:
+            st.caption(f"Metadata for {len(meta)} sequences · years "
+                       f"{meta['Year'].min()}–{meta['Year'].max()}")
+
+    if meta is not None and not meta.empty and meta["Year"].notna().any():
+        tracked = selected[:8] or list(view["Mutation"].head(4))
+        included = run.variants.per_sequence.query("Status == 'included'")["Sequence ID"]
+        by_year = annotate.variants_by_year(run.variants.events, meta, tracked, included=included)
+        if not by_year.empty:
+            chart(viz.variant_timeline(by_year, dark=dark), key="timeline")
+
+    with st.expander("Substitution heatmap"):
+        chart(viz.substitution_heatmap(view, unique=unique, dark=dark), key="subheat")
+    return selected
+
+
+def variant_detail(run: SpaceRun, summary: pd.DataFrame, selected: List[str], dark: bool) -> None:
+    mut = selected[0]
+    row = summary.set_index("Mutation").loc[mut]
+    carriers = row["Sequence IDs"].split(";")
+    pos = int(row["Position"])
+    p = run.positions.set_index("Position").loc[pos]
+    with st.container(border=True):
+        st.markdown(f"#### {mut} · `{row['HGVS']}`")
+        c = st.columns(4)
+        c[0].metric("Carriers", f"{row['Count']} / {row['Covering']}", help="Sequences carrying it / covering it")
+        c[1].metric("Unique carriers", f"{row['Unique carriers']} / {row['Unique covering']}")
+        c[2].metric("al2co at position", "–" if pd.isna(p["al2co_score"]) else f"{p['al2co_score']:.2f}")
+        c[3].metric("Other variants here", int(p["Variants"]) - 1)
+        st.caption(f"{row['Type']} · {row['Change']}" + (f" · BLOSUM62 {row['BLOSUM62']:.0f}"
+                                                        if pd.notna(row["BLOSUM62"]) else ""))
+        table = pd.DataFrame({"Sequence ID": carriers})
+        meta = st.session_state.get("metadata")
+        if meta is not None and not meta.empty:
+            table = table.merge(meta, on="Sequence ID", how="left")
+        hits = run.hits.drop_duplicates("id").set_index("id")
+        if "description" in hits:
+            table["Description"] = table["Sequence ID"].map(hits["description"])
+        st.dataframe(table, hide_index=True, height=min(300, 36 * len(table) + 38))
+        if len(selected) > 1:
+            st.caption(f"Also selected: {', '.join(selected[1:])}")
+
+
+def conservation_tab(run: SpaceRun, dark: bool) -> None:
+    positions = run.positions
+    chart(viz.conservation_plot(positions, dark=dark), key="cons")
+    L = len(run.reference)
+    if L < 3:
+        return
+    c = st.columns([3, 1])
+    start = c[0].slider("Logo window start", 1, max(1, L - 1), 1)
+    width = c[1].number_input("Window width", 20, 200, 60, step=10)
+    threshold = st.slider("Consensus identity threshold", 0.0, 1.0, 0.6, 0.05,
+                          help="Positions where the most common residue is rarer than this become X.")
+    bits, consensus = logo_and_consensus(run.msa, run.mapping, threshold)
+    chart(viz.sequence_logo(bits, start, min(L, start + int(width) - 1), dark=dark), key="logo")
+    st.markdown("**Consensus**")
+    st.code(consensus, language=None, wrap_lines=True)
+
+
+@st.fragment
+def structure_tab(run: SpaceRun, selected: List[str], dark: bool) -> None:
+    sdir = run.run_dir / "structure"
+    src = st.segmented_control("Structure source", ["AlphaFold", "PDB search", "Upload"], default="AlphaFold",
+                               required=True)
+    path, meta, label = None, None, None
+    if src == "AlphaFold":
+        c = st.columns([3, 1])
+        acc = c[0].text_input("UniProt accession", value=reference_accession(run), placeholder="e.g. P04637")
+        if c[1].button("Load model", disabled=not acc, width="stretch"):
+            try:
+                path, meta = download_alphafold(acc, sdir)
+                label = acc
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+    elif src == "PDB search":
+        c = st.columns([3, 1])
+        ident = c[0].slider("Minimum sequence identity", 0.3, 1.0, 0.9, 0.05)
+        if c[1].button("Search RCSB", width="stretch"):
+            try:
+                st.session_state.pdb_hits = search_pdb(run.reference, identity_cutoff=ident)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"RCSB search failed: {exc}")
+        hits = st.session_state.get("pdb_hits")
+        if hits is not None:
+            if not hits:
+                st.warning("No experimental structures at this identity. Try a lower cutoff or AlphaFold.")
+            else:
+                c = st.columns([3, 1])
+                pid = c[0].selectbox(f"{len(hits)} entries", hits)
+                if c[1].button("Load entry", width="stretch"):
+                    try:
+                        path, meta, label = download_pdb(pid, sdir), pdb_metadata(pid), pid
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(str(exc))
+    else:
+        up = st.file_uploader("PDB or mmCIF file", type=["pdb", "ent", "cif"])
+        if up is not None and st.button("Use uploaded structure"):
+            sdir.mkdir(parents=True, exist_ok=True)
+            suffix = ".cif" if up.name.lower().endswith(".cif") else ".pdb"
+            path = str(sdir / f"uploaded{suffix}")
+            Path(path).write_bytes(up.getbuffer())
+            meta, label = {"id": up.name, "title": "Uploaded structure"}, up.name
+
+    if path:
+        try:
+            al = run.positions.set_index("Position")["al2co_score"].dropna().to_dict()
+            st.session_state.structure = map_to_structure(
+                path, run.reference, values=al, out_dir=sdir / "mapped", source=src,
+                structure_id=label, metadata=meta)
+            st.rerun()  # refresh variant table structure columns
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not map the structure: {exc}")
+
+    sm = st.session_state.get("structure")
+    if not sm:
+        st.info("Load a structure to see conservation and variants in 3D.")
+        return
+
+    md = sm.metadata
+    st.caption(" · ".join(str(v) for k, v in md.items() if v and v != "N/A" and k != "authors"))
+    chain_table = pd.DataFrame([{"Chain": c, "Coverage (%)": round(m.coverage, 1),
+                                 "Identity (%)": round(m.identity, 1), "Residues": len(m.residues)}
+                                for c, m in sm.chains.items()])
+    c = st.columns([1.5, 2.6, 2.2, 2.2])
+    chains = c[0].multiselect("Chains", list(sm.chains), default=[sm.best_chain])
+    mode = c[1].segmented_control("Colour by", ["Conservation", "Variant frequency"], default="Conservation",
+                                  required=True)
+    style = c[2].segmented_control("Style", ["cartoon", "stick", "sphere"], default="cartoon", required=True)
+    show = c[3].segmented_control("Label", ["Selected", "Top 20", "None"], default="Selected" if selected else "Top 20",
+                                  required=True)
+
+    positions = run.positions.set_index("Position")
+    summary = run.variants.summary
+    if mode == "Conservation":
+        per_pos = positions["al2co_score"].dropna()
+    else:
+        per_pos = positions["Max frequency"] * 100
+    finite = per_pos[np.isfinite(per_pos)]
+    vmin, vmax = (float(finite.min()), float(finite.max())) if not finite.empty else (0.0, 1.0)
+    if show == "Selected":
+        label_muts = summary[summary["Mutation"].isin(selected)]
+    elif show == "Top 20":
+        label_muts = summary.head(20)
+    else:
+        label_muts = summary.iloc[0:0]
+
+    payload = []
+    for ch in chains:
+        cm = sm.chains[ch]
+        values = {cm.ref_to_residue[p]: float(v) for p, v in per_pos.items() if p in cm.ref_to_residue}
+        default = vmax if mode == "Conservation" else vmin
+        hl = []
+        for pos, g in label_muts.groupby("Position"):
+            if pos in cm.ref_to_residue:
+                hl.append((cm.ref_to_residue[pos][0], ", ".join(g["Mutation"].head(3))))
+        payload.append({"pdb": viz.pdb_with_values(cm.pdb_path, values, default), "vmin": vmin, "vmax": vmax,
+                        "highlights": hl})
+    if payload:
+        st.iframe(viz.structure_html(payload, "conservation" if mode == "Conservation" else "frequency",
+                                     style=style, label_positions=show != "None", dark=dark, height=560),
+                  height=580)
+        if mode == "Conservation":
+            ramp = "faint = variable → strong blue = conserved"
+        else:
+            ramp = "grey = no variant → strongest orange = most frequent variant"
+        st.caption(f"Colour: {ramp} ({vmin:.2f} to {vmax:.2f}). Unmapped residues use the "
+                   f"{'conserved' if mode == 'Conservation' else 'no-variant'} colour.")
+    st.dataframe(chain_table, hide_index=True)
+    ctx = annotate.add_structure_context(summary, sm.chains[chains[0] if chains else sm.best_chain])
+    if "RSA" in ctx:
+        unmapped = int((ctx["Structure residue"] == "").sum())
+        ctx = ctx[ctx["Structure residue"] != ""]
+        n_surface = (ctx["Exposure"] == "surface").sum()
+        st.markdown(f"**Structural context** · {n_surface} of {len(ctx)} modelled variants at surface-exposed "
+                    f"residues" + (f" ({unmapped} fall outside the model)" if unmapped else ""))
+        st.dataframe(ctx[["Mutation", "Frequency", "Structure residue", "RSA", "Exposure", "B-factor / pLDDT"]],
+                     hide_index=True, height=300,
+                     column_config={"Frequency": st.column_config.NumberColumn(format="percent"),
+                                    "RSA": st.column_config.NumberColumn(format="%.2f")})
+
+
+def alignment_tab(run: SpaceRun, selected: List[str], dark: bool) -> None:
+    L = len(run.reference)
+    if L < 3:
+        st.info("The reference is too short to display an alignment window.")
+        return
+    carriers = []
+    if selected:
+        ev = run.variants.events
+        carriers = list(ev.loc[ev["Mutation"] == selected[0], "MSA ID"].astype(str).unique())
+    c = st.columns([3, 1, 2, 2])
+    default_start = 1
+    if selected:
+        default_start = max(1, int(run.variants.summary.set_index("Mutation").loc[selected[0], "Position"]) - 30)
+    start = c[0].slider("Window start", 1, max(1, L), min(default_start, L))
+    width = c[1].number_input("Width", 20, 400, 80, step=20)
+    only = c[2].toggle(f"Only carriers of {selected[0]}" if selected else "Only carriers of a selected variant",
+                       disabled=not selected)
+    diff = c[3].toggle("Differences from reference only", value=True)
+    chart(viz.msa_view(run.msa, run.mapping, start, min(L, start + int(width) - 1),
+                       row_ids=carriers if only else None, differences_only=diff, dark=dark), key="msa")
+    if run.tree:
+        note = " (random subset)" if run.tree.subsampled else ""
+        st.caption(f"{run.tree.method} tree from MSA identity distances{note}.")
+        chart(viz.tree_figure(run.tree.newick_path, highlight=carriers,
+                              highlight_label=f"{selected[0]} carriers" if selected else "carriers", dark=dark),
+              key="tree")
+    else:
+        st.info("No tree for this run.")
+
+
+def sequences_tab(run: SpaceRun) -> None:
+    ps = run.variants.per_sequence.copy()
+    hits = run.hits.drop_duplicates("id").set_index("id")
+    ps["Identity (%)"] = ps["Sequence ID"].map(hits["identity"])
+    meta = st.session_state.get("metadata")
+    if meta is not None and not meta.empty:
+        ps = ps.merge(meta, on="Sequence ID", how="left")
+    st.markdown(f"**{(ps['Status'] == 'included').sum()} analysed**, "
+                f"{(ps['Status'] == 'excluded').sum()} excluded")
+    st.dataframe(ps.drop(columns=["MSA ID"]), hide_index=True, height=480,
+                 column_config={"Coverage (%)": st.column_config.NumberColumn(format="%.1f"),
+                                "Internal deletions (%)": st.column_config.NumberColumn(format="%.1f"),
+                                "Identity (%)": st.column_config.NumberColumn(format="%.1f")})
+    with st.expander(f"All fetched sequences ({len(run.hits)})"):
+        st.dataframe(run.hits.drop(columns=["sequence"], errors="ignore"), hide_index=True)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _zip_run(run_dir: str, stamp: float) -> bytes:
+    buf = io.BytesIO()
+    root = Path(run_dir)
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(root.rglob("*")):
+            if f.is_file():
+                z.write(f, arcname=str(Path(root.name) / f.relative_to(root)))
+    return buf.getvalue()
+
+
+def export_tab(run: SpaceRun) -> None:
+    # The run is saved when created/opened; re-saving on every rerun would
+    # bust the ZIP cache below.
+    stamp = (run.run_dir / "run.json").stat().st_mtime
+    st.download_button("Download all results (ZIP)", _zip_run(str(run.run_dir), stamp),
+                       file_name=f"{run.run_id}.zip", mime="application/zip", type="primary")
+    s = annotated_summary(run)
+    c = st.columns(3)
+    c[0].download_button("Variants (TSV)", s.to_csv(sep="\t", index=False), f"{run.run_id}_variants.tsv")
+    c[1].download_button("Per-sequence calls (TSV)", run.variants.per_sequence.to_csv(sep="\t", index=False),
+                         f"{run.run_id}_sequences.tsv")
+    c[2].download_button("Per-position table (TSV)", run.positions.to_csv(sep="\t", index=False),
+                         f"{run.run_id}_positions.tsv")
+    st.markdown("**Reuse this run from Python, the CLI or an MCP client**")
+    st.code(f'from space.core.pipeline import SpaceRun\nrun = SpaceRun.load("{run.run_dir}")\n'
+            f'run.variants.filter(min_frequency=0.01)', language="python")
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    session_dir()
+    sidebar()
+    dark = is_dark()
+    run = st.session_state.get("run")
+    if run is not None:
+        results(run, dark)
+    elif st.session_state.get("records"):
+        setup_stage(dark)
+    else:
+        welcome()
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "space-variants"
+version = "2.0.0"
+description = "SPACE: find and interpret protein variants across sequence databases"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Dawid Zyla" }]
+dependencies = [
+    "biopython>=1.84",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scipy>=1.11",
+    "requests>=2.31",
+    "pyfamsa>=0.5",
+    "al2co @ git+https://github.com/dzyla/al2co.git",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.50", "plotly>=5.24", "py3Dmol>=2.4"]
+mcp = ["mcp>=2.0"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+space = "space.cli:main"
+space-mcp = "space.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["space*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["network: needs internet access (run with SPACE_NETWORK_TESTS=1)"]

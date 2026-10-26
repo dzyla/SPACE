@@ -1,25 +1,22 @@
 #!/bin/bash
+# Create a SPACE environment with uv (Linux/macOS). Run from the repository root.
+set -euo pipefail
 
-# Bash script for Linux/macOS
+if ! command -v uv >/dev/null 2>&1; then
+    echo "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
 
-# Install uv
-echo "Installing uv on Linux/macOS..."
-curl -LsSf https://astral.sh/uv/install.sh | sh
+echo "Creating .venv (Python 3.12)..."
+uv venv .venv --python 3.12
 
-# Initialize uv
-echo "Initializing uv..."
-uv init
+echo "Installing requirements (al2co is compiled from source; needs gcc)..."
+uv pip install --python .venv/bin/python -r requirements.txt pytest
 
-# Create a virtual environment called "space" with uv
-echo "Creating virtual environment 'space'..."
-uv venv space_env
-
-# Activate the "space" environment
-echo "Activating 'space' environment..."
-source space_env/bin/activate || { echo "Failed to activate 'space' environment. Exiting."; exit 1; }
-
-# Install required packages in the 'space' environment
-echo "Installing required packages in 'space' environment..."
-uv pip install streamlit py3Dmol stmol pandas biopython plotly kaleido scipy biopandas ipython_genutils joblib seaborn rcsbsearchapi
-
-echo "Environment 'space' setup complete with all required packages."
+echo
+echo "Done. Next steps:"
+echo "  source .venv/bin/activate"
+echo "  streamlit run app.py          # web app"
+echo "  python -m space --help        # command line"
+echo "  python -m space mcp           # MCP server (stdio)"
