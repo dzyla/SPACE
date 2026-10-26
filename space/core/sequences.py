@@ -6,6 +6,7 @@ import os
 import re
 import time
 from io import StringIO
+from urllib.parse import quote_plus
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -162,7 +163,7 @@ def fetch_ncbi(
     limit = FETCH_ALL_CAP if max_seqs is None or max_seqs < 0 else int(max_seqs)
     retmax = min(max(limit * 3, 300), FETCH_ALL_CAP)
 
-    term = f"({query}) AND refseq[filter]" if refseq_only else query
+    term = database_query(query, "ncbi", refseq_only=refseq_only)
     report(progress, 0.02, "Searching NCBI Protein")
     ids = _esearch_ids(term, retmax)
     sp_ids: List[str] = []
@@ -214,7 +215,7 @@ def fetch_uniprot(
     ``max_seqs`` is honoured beyond the 500-per-page API limit.
     """
     limit = FETCH_ALL_CAP if max_seqs is None or max_seqs < 0 else int(max_seqs)
-    q = f"({query}) AND reviewed:true" if reviewed_only else query
+    q = database_query(query, "uniprot", reviewed_only=reviewed_only)
     url: Optional[str] = UNIPROT_SEARCH_URL
     params: Optional[dict] = {
         "query": q, "format": "fasta", "size": min(UNIPROT_PAGE_SIZE, max(limit, 1)),
@@ -240,6 +241,23 @@ def fetch_uniprot(
         raise ValueError(f"No UniProt entries found for query: {query!r}")
     log.info("UniProt: fetched %d sequences (total matching: %s).", len(records), total)
     return os.path.abspath(write_fasta(records, out_path))
+
+
+def database_query(query: str, source: str, refseq_only: bool = False, reviewed_only: bool = False) -> str:
+    """The exact search term sent to ``source`` (filters appended)."""
+    if source.lower() == "ncbi" and refseq_only:
+        return f"({query}) AND refseq[filter]"
+    if source.lower() == "uniprot" and reviewed_only:
+        return f"({query}) AND reviewed:true"
+    return query
+
+
+def search_url(query: str, source: str, refseq_only: bool = False, reviewed_only: bool = False) -> str:
+    """Web search page for the same term, to check hits before fetching."""
+    term = quote_plus(database_query(query, source, refseq_only, reviewed_only))
+    if source.lower() == "ncbi":
+        return f"https://www.ncbi.nlm.nih.gov/protein/?term={term}"
+    return f"https://www.uniprot.org/uniprotkb?query={term}"
 
 
 def fetch_sequences(

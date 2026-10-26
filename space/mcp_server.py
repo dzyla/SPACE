@@ -273,9 +273,8 @@ def get_variant(run_id: str, mutation: str, max_carriers: int = 50) -> Dict[str,
         "carriers": carriers[:max_carriers],
         "n_carriers": len(carriers),
     }
-    meta_p = run.run_dir / "tables" / "metadata.tsv"
-    if meta_p.exists():
-        meta = pd.read_csv(meta_p, sep="\t", dtype={"Sequence ID": str})
+    meta = annotate.load_metadata(run.run_dir)
+    if meta is not None:
         sub = meta[meta["Sequence ID"].isin(carriers)]
         detail["carrier_metadata"] = {
             "hosts": sub["Host"].value_counts().head(10).to_dict(),
@@ -372,7 +371,7 @@ def fetch_sample_metadata(run_id: str, email: Optional[str] = None) -> Dict[str,
     if not mail:
         raise ValueError("NCBI requires an email address.")
     meta = annotate.ncbi_source_metadata(list(run.selected["id"]), mail)
-    meta.to_csv(run.run_dir / "tables" / "metadata.tsv", sep="\t", index=False)
+    annotate.save_metadata(run.run_dir, meta)
     years = meta["Year"].dropna()
     return {"run_id": run_id, "sequences": int(len(meta)),
             "years": [int(years.min()), int(years.max())] if not years.empty else None,
@@ -384,12 +383,11 @@ def fetch_sample_metadata(run_id: str, email: Optional[str] = None) -> Dict[str,
 def variant_trend(run_id: str, mutations: List[str]) -> Dict[str, Any]:
     """Per collection year carrier fraction for up to 10 mutations (needs fetch_sample_metadata)."""
     run = _load(run_id)
-    meta_p = run.run_dir / "tables" / "metadata.tsv"
-    if not meta_p.exists():
+    meta = annotate.load_metadata(run.run_dir)
+    if meta is None:
         raise ValueError("Call fetch_sample_metadata first.")
     included = run.variants.per_sequence.query("Status == 'included'")["Sequence ID"]
-    by_year = annotate.variants_by_year(run.variants.events, pd.read_csv(meta_p, sep="\t", dtype={"Sequence ID": str}),
-                                        mutations[:10], included=included)
+    by_year = annotate.variants_by_year(run.variants.events, meta, mutations[:10], included=included)
     return {"run_id": run_id, "trend": _records(by_year)}
 
 

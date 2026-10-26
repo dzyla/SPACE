@@ -19,13 +19,13 @@ needs a C compiler. `mcp` is only needed for the MCP server.
 
 | Module | Role |
 |---|---|
-| `space/core/sequences.py` | `clean_sequence`, `parse_sequence_text`, `read_fasta`, `fetch_ncbi` (retry, API key, Swiss-Prot merge), `fetch_uniprot` (cursor pagination) |
+| `space/core/sequences.py` | `clean_sequence`, `parse_sequence_text`, `read_fasta`, `fetch_ncbi` (retry, API key, Swiss-Prot merge), `fetch_uniprot` (cursor pagination), `database_query`/`search_url` (exact term + web link for previewing hits) |
 | `space/core/align.py` | BLOSUM62 semi-global `get_aligner`, `pairwise_to_reference` (identity / aligned identity / coverage), `filter_hits`, `run_msa` (pyfamsa → FASTA + CLUSTAL), `reference_mapping`, `position_map` |
 | `space/core/conservation.py` | `al2co_scores`, `column_profile` (modal frequency, entropy, gaps), `logo_and_consensus` |
 | `space/core/variants.py` | `call_variants` → `VariantCalls` (`events`, `summary`, `per_sequence`, `coverage`, `unique_coverage`, `filter()`) |
 | `space/core/tree.py` | `build_tree` (NJ ≤ 200 leaves, UPGMA above, subsample > 600) → Newick |
 | `space/core/structure.py` | `search_pdb`, `download_pdb` (.pdb → .cif fallback), `download_alphafold`, `map_to_structure` → `StructureMapping` (per-chain residue map incl. insertion codes, B-factor/pLDDT, RSA) |
-| `space/core/annotate.py` | `uniprot_features`, `known_variants` (EBI Proteins API), `merge_known_variants`, `add_structure_context`, `ncbi_source_metadata`, `variants_by_year` |
+| `space/core/annotate.py` | `uniprot_features`, `known_variants` (EBI Proteins API), `merge_known_variants`, `add_structure_context`, `ncbi_source_metadata` (concurrent batches, `progress`, `should_stop`), `save_metadata`/`load_metadata` (`tables/metadata.tsv`), `variants_by_year` |
 | `space/core/pipeline.py` | `run_pipeline`, `analyse`, `choose_reference`, `SpaceRun` (save/load), `list_runs` |
 | `space/viz.py` | Plotly figures (landscape, heatmap, logo, MSA, tree, timeline) + `structure_html` |
 | `app.py` | Streamlit UI |
@@ -112,3 +112,10 @@ Expected failures are raised as `ToolError` so the message reaches the client.
 - `map_to_structure` skips chains below 40% identity (antibodies and other
   partners otherwise produce spurious alignments).
 - After editing `space/*`, restart a running Streamlit server.
+- App: the sidebar search panel is an `st.fragment` (not `st.form`) so the
+  preview link follows the query; anything it triggers that changes the main
+  area must call `st.rerun()`. GenBank metadata runs in a background thread
+  that only writes to a dict; `metadata_progress` (fragment, `run_every=1`) polls it.
+- Dark mode: ramps never start at a step close to the surface
+  (`seq_ramp`, `frequency_ramp`); figures use an opaque paper colour so a
+  theme mismatch cannot hide text.

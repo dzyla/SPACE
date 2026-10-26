@@ -11,15 +11,20 @@ All network calls are cached per process.
 
 from __future__ import annotations
 
+import os
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
 import requests
 
-from . import log
+from . import ProgressFn, log, report
 from .align import position_map
 
 UNIPROT_ENTRY = "https://rest.uniprot.org/uniprotkb/{acc}.json"
@@ -206,37 +211,121 @@ def add_feature_overlaps(summary: pd.DataFrame, features: pd.DataFrame) -> pd.Da
 _YEAR = re.compile(r"(1[89]\d\d|20\d\d)")
 
 
-def ncbi_source_metadata(accessions: List[str], email: str, batch: int = 200) -> pd.DataFrame:
-    """Organism / host / country / collection date for NCBI protein accessions."""
-    from Bio import Entrez, SeqIO
+METADATA_COLUMNS = ["Sequence ID", "Organism", "Strain", "Host", "Country", "Collection date", "Year"]
+METADATA_FILE = "metadata.tsv"
+
+
+def _parse_gp(handle) -> List[dict]:
+    import warnings
+
+    from Bio import BiopythonParserWarning, SeqIO
+
+    # Harmless for metadata (feature bonds); filterwarnings is process-wide, unlike catch_warnings.
+    warnings.filterwarnings("ignore", message="Dropping bond qualifier", category=BiopythonParserWarning)
+
+    rows = []
+    for rec in SeqIO.parse(handle, "genbank"):
+        src = next((f for f in rec.features if f.type == "source"), None)
+        q = src.qualifiers if src else {}
+        date = (q.get("collection_date") or [""])[0]
+        year = _YEAR.search(date)
+        rows.append({
+            "Sequence ID": rec.id, "Organism": rec.annotations.get("organism", ""),
+            "Strain": (q.get("strain") or q.get("isolate") or [""])[0],
+            "Host": (q.get("host") or [""])[0],
+            "Country": (q.get("geo_loc_name") or q.get("country") or [""])[0].split(":")[0],
+            "Collection date": date,
+            "Year": int(year.group(1)) if year else None,
+        })
+    return rows
+
+
+def ncbi_source_metadata(
+    accessions: List[str],
+    email: str,
+    batch: int = 100,
+    workers: Optional[int] = None,
+    progress: ProgressFn = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> pd.DataFrame:
+    """Organism / host / country / collection date for NCBI protein accessions.
+
+    Batches are fetched concurrently (3 at a time, 8 with ``$NCBI_API_KEY``,
+    staying under NCBI's request-rate limits), each retried once on failure.
+    ``progress(fraction, message)`` is called after every batch;
+    ``should_stop()`` returning True abandons the remaining batches and returns
+    what has been fetched so far.
+    """
+    from Bio import Entrez
 
     Entrez.email = email
-    rows = []
-    accs = [a for a in accessions if a and not a.lower().startswith("pdb|")]
-    for start in range(0, len(accs), batch):
-        chunk = accs[start:start + batch]
-        try:
-            handle = Entrez.efetch(db="protein", id=",".join(chunk), rettype="gp", retmode="text")
-            for rec in SeqIO.parse(handle, "genbank"):
-                src = next((f for f in rec.features if f.type == "source"), None)
-                q = src.qualifiers if src else {}
-                date = (q.get("collection_date") or [""])[0]
-                year = _YEAR.search(date)
-                rows.append({
-                    "Sequence ID": rec.id, "Organism": rec.annotations.get("organism", ""),
-                    "Strain": (q.get("strain") or q.get("isolate") or [""])[0],
-                    "Host": (q.get("host") or [""])[0],
-                    "Country": (q.get("geo_loc_name") or q.get("country") or [""])[0].split(":")[0],
-                    "Collection date": date,
-                    "Year": int(year.group(1)) if year else None,
-                })
-            handle.close()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("GenBank metadata batch failed: %s", exc)
-    df = pd.DataFrame(rows, columns=["Sequence ID", "Organism", "Strain", "Host", "Country",
-                                     "Collection date", "Year"])
+    if os.environ.get("NCBI_API_KEY"):
+        Entrez.api_key = os.environ["NCBI_API_KEY"]
+    workers = workers or (8 if Entrez.api_key else 3)
+    accs = list(dict.fromkeys(a for a in accessions if a and not a.lower().startswith("pdb|")))
+    chunks = [accs[i:i + batch] for i in range(0, len(accs), batch)]
+    # Bio.Entrez spaces requests with an unsynchronised timestamp; serialise the
+    # request start across threads so concurrent batches respect the rate limit.
+    gate, min_gap = threading.Lock(), 0.11 if Entrez.api_key else 0.34
+    last = [0.0]
+
+    def fetch(chunk: List[str]) -> List[dict]:
+        for attempt in range(2):
+            if should_stop and should_stop():
+                return []
+            with gate:
+                wait = last[0] + min_gap - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                last[0] = time.monotonic()
+            try:
+                handle = Entrez.efetch(db="protein", id=",".join(chunk), rettype="gp", retmode="text")
+                try:
+                    return _parse_gp(handle)
+                finally:
+                    handle.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("GenBank metadata batch failed (attempt %d): %s", attempt + 1, exc)
+                time.sleep(2)
+        return []
+
+    rows: List[dict] = []
+    report(progress, 0.0, f"Fetching GenBank records for {len(accs)} sequences")
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(fetch, c) for c in chunks]
+        done = 0
+        for fut in as_completed(futures):
+            rows += fut.result()
+            done += 1
+            report(progress, done / max(len(chunks), 1),
+                   f"GenBank records: {min(done * batch, len(accs))} / {len(accs)}")
+            if should_stop and should_stop():
+                for f in futures:
+                    f.cancel()
+    df = pd.DataFrame(rows, columns=METADATA_COLUMNS)
     df["Year"] = df["Year"].astype("Int64")
     return df
+
+
+def save_metadata(run_dir, meta: pd.DataFrame) -> Path:
+    path = Path(run_dir) / "tables" / METADATA_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta.to_csv(path, sep="\t", index=False)
+    return path
+
+
+def load_metadata(run_dir) -> Optional[pd.DataFrame]:
+    """Metadata saved with the run (by the app, CLI or MCP server), if any."""
+    path = Path(run_dir) / "tables" / METADATA_FILE
+    if not path.exists():
+        return None
+    meta = pd.read_csv(path, sep="\t", keep_default_na=False, na_values=[""],
+                       dtype={c: str for c in METADATA_COLUMNS if c != "Year"})
+    meta["Year"] = pd.to_numeric(meta["Year"], errors="coerce").astype("Int64")
+    for c in METADATA_COLUMNS[1:-1]:
+        if c in meta:
+            meta[c] = meta[c].fillna("")
+    return meta
 
 
 _OS = re.compile(r"OS=(.+?)(?: OX=| GN=| PE=| SV=|$)")

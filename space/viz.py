@@ -2,10 +2,12 @@
 
 Colour roles (validated with the dataviz palette checks):
   * variant type  -> categorical slots 1-3 (blue / orange / aqua) + marker shape
-  * conservation  -> sequential blue (light = variable, dark = conserved)
-  * frequency     -> sequential orange (second sequential context)
+  * variability   -> sequential blue; strong colour = variable position
+  * frequency     -> sequential orange on a log scale (most variants are rare)
   * amino acids   -> WebLogo-style chemistry classes (letters carry identity)
-Every builder takes ``dark`` and picks the matching selected steps.
+Every builder takes ``dark`` and picks the matching selected steps. Ramps never
+start at a step that disappears into the surface: anything with a value must
+stay visible in both themes.
 """
 
 from __future__ import annotations
@@ -45,7 +47,11 @@ CHEMISTRY_COLORS = {
 }
 CHEMISTRY_LEGEND = [("Acidic", "#E03131"), ("Basic", "#1971C2"), ("Polar", "#2F9E44"),
                     ("Hydrophobic", "#52585E"), ("Glycine", "#E8590C")]
+# Hydrophobic grey must stay readable on the dark surface.
+CHEMISTRY_DARK = {**CHEMISTRY_COLORS, **dict.fromkeys("AVLIPWFM", "#8b9299"), **dict.fromkeys("XBZJUO", "#6c727a")}
 GAP_COLOR = {False: "#e1e0d9", True: "#2c2c2a"}
+# Residues without a value in the 3D view: neutral but clearly visible on either background.
+NEUTRAL_3D = {False: "#d3d2cc", True: "#6e6d68"}
 
 FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 
@@ -59,10 +65,26 @@ def type_colors(dark: bool = False) -> Dict[str, str]:
     return dict(zip(TYPE_ORDER, s[:3]))
 
 
+def chemistry_colors(dark: bool = False) -> Dict[str, str]:
+    return CHEMISTRY_DARK if dark else CHEMISTRY_COLORS
+
+
+def chemistry_legend(dark: bool = False) -> List[tuple]:
+    c = chemistry_colors(dark)
+    return [(name, c[aa]) for name, aa in (("Acidic", "D"), ("Basic", "K"), ("Polar", "S"),
+                                           ("Hydrophobic", "L"), ("Glycine", "G"))]
+
+
 def seq_ramp(colors: Sequence[str], dark: bool) -> List[str]:
-    """Sequential ramp whose low end recedes into the surface: light→dark on a
-    light surface, dark→light on a dark one."""
-    return list(colors)[::-1] if dark else list(colors)
+    """Sequential ramp, low → high: light→dark on a light surface, dark→light on a
+    dark one. In dark mode the two darkest steps are dropped so the low end stays
+    visible against the surface."""
+    return list(colors)[::-1][2:] if dark else list(colors)
+
+
+def frequency_ramp(dark: bool) -> List[str]:
+    """Orange ramp for frequencies; the lowest step is still clearly visible."""
+    return list(SEQ_ORANGE[1:]) if not dark else list(SEQ_ORANGE[::-1][1:6])
 
 
 def _scale(colors: Sequence[str]) -> list:
@@ -75,16 +97,17 @@ def _style(fig: go.Figure, dark: bool, title: Optional[str] = None, height: Opti
     fig.update_layout(
         title=dict(text=title, font=dict(size=14, color=t["ink"]), x=0, xanchor="left") if title else None,
         font=dict(family=FONT, size=12, color=t["ink2"]),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=t["surface"],
+        paper_bgcolor=t["surface"], plot_bgcolor=t["surface"],
         margin=dict(l=56, r=16, t=48 if title else 16, b=44),
         hoverlabel=dict(bgcolor=t["surface"], bordercolor=t["axis"], font=dict(color=t["ink"], family=FONT)),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
                     bgcolor="rgba(0,0,0,0)", font=dict(color=t["ink2"])),
     )
+    fig.update_annotations(font_color=t["ink2"])
     fig.update_xaxes(showgrid=False, linecolor=t["axis"], tickcolor=t["axis"], zeroline=False,
-                     title_font=dict(color=t["ink2"]))
+                     title_font=dict(color=t["ink2"]), tickfont=dict(color=t["ink2"]))
     fig.update_yaxes(gridcolor=t["grid"], gridwidth=1, linecolor=t["axis"], zeroline=False,
-                     title_font=dict(color=t["ink2"]))
+                     title_font=dict(color=t["ink2"]), tickfont=dict(color=t["ink2"]), automargin=True)
     if height:
         fig.update_layout(height=height)
     return fig
@@ -161,7 +184,7 @@ def variant_landscape(
         for p, v in top.items():
             sx += [p, p, None]
             sy += [1e-6 if log_y else 0, v, None]
-        fig.add_trace(go.Scatter(x=sx, y=sy, mode="lines", line=dict(color=t["axis"], width=1),
+        fig.add_trace(go.Scatter(x=sx, y=sy, mode="lines", line=dict(color=t["muted"], width=1),
                                  hoverinfo="skip", showlegend=False), row=1, col=1)
         for typ in TYPE_ORDER:
             d = s[s["Type"] == typ]
@@ -190,12 +213,13 @@ def variant_landscape(
                          range=[math.log10(lo / 2), math.log10(150)], row=1, col=1)
     fig.update_yaxes(title=ylab, row=1, col=1)
 
-    # conservation strip
+    # variability strip: strong colour = variable position (low al2co), conserved recedes
     cons = positions["al2co_score"] if "al2co_score" in positions else pd.Series(np.nan, index=positions.index)
+    ramp = ([t["grid"]] + seq_ramp(SEQ_BLUE, dark)[1:]) if dark else seq_ramp(SEQ_BLUE, dark)
     fig.add_trace(go.Heatmap(
-        z=[cons.to_numpy()], x=positions["Position"], y=["al2co"], colorscale=_scale(seq_ramp(SEQ_BLUE, dark)),
-        showscale=False, customdata=[positions["Residue"]],
-        hovertemplate="Position %{x} (%{customdata})<br>al2co %{z:.2f}<extra></extra>",
+        z=[(-cons).to_numpy()], x=positions["Position"], y=["variability"], colorscale=_scale(ramp),
+        showscale=False, customdata=np.stack([positions["Residue"], cons.round(2)], axis=-1)[None, :, :],
+        hovertemplate="Position %{x} (%{customdata[0]})<br>al2co %{customdata[1]}<extra></extra>",
     ), row=2, col=1)
     fig.update_yaxes(showgrid=False, row=2, col=1)
 
@@ -248,21 +272,30 @@ def substitution_heatmap(summary: pd.DataFrame, unique: bool = False, max_positi
     cols = sorted(s["Position"].unique())
     aas = list("ACDEFGHIKLMNPQRSTVWY")
     ref_at = s.drop_duplicates("Position").set_index("Position")["Ref"]
-    z = np.full((len(aas), len(cols)), np.nan)
+    pct_ = np.full((len(aas), len(cols)), np.nan)
     ci = {p: i for i, p in enumerate(cols)}
     for alt, pos, f in zip(s["Alt"], s["Position"], s[freq_col]):
         if alt in aas:
-            z[aas.index(alt), ci[pos]] = f * 100
+            pct_[aas.index(alt), ci[pos]] = f * 100
     labels = [f"{ref_at[p]}{p}" for p in cols]
-    ramp = [t["surface"]] + seq_ramp(SEQ_ORANGE[1:], dark)
+    # Log colour scale: most observed substitutions are a few percent, a linear
+    # scale would paint them all in the faintest step.
+    lo = max(0.01, float(np.nanmin(pct_))) if np.isfinite(pct_).any() else 0.01
+    zmin, zmax = math.floor(math.log10(lo)), 2
+    ticks = [10.0 ** e for e in range(zmin, zmax + 1)]
     fig = go.Figure(go.Heatmap(
-        z=z, x=labels, y=aas, colorscale=_scale(ramp), xgap=2, ygap=2, zmin=0,
-        colorbar=dict(title=dict(text="%", side="right"), thickness=10, outlinewidth=0),
-        hovertemplate="%{x} → %{y}<br>%{z:.2f}% of covering sequences<extra></extra>",
+        z=np.log10(pct_), x=labels, y=aas, colorscale=_scale(frequency_ramp(dark)), xgap=2, ygap=2,
+        zmin=zmin, zmax=zmax, customdata=pct_,
+        colorbar=dict(title=dict(text="% of covering", side="right"), thickness=10, outlinewidth=0,
+                      tickvals=np.log10(ticks), ticktext=[f"{v:g}" for v in ticks],
+                      tickfont=dict(color=t["ink2"]), title_font=dict(color=t["ink2"])),
+        hovertemplate="%{x} → %{y}<br>%{customdata:.2f}% of covering sequences<extra></extra>",
     ))
     fig.update_xaxes(type="category", tickangle=-60, title="Reference residue")
     fig.update_yaxes(title="Observed residue", autorange="reversed", showgrid=False)
-    return _style(fig, dark, "Observed substitutions", 460)
+    fig = _style(fig, dark, "Observed substitutions", 460)
+    fig.update_layout(plot_bgcolor=t["grid"] if dark else "#f1f0ec")  # empty cells read as a lattice
+    return fig
 
 
 def variant_timeline(by_year: pd.DataFrame, dark: bool = False) -> go.Figure:
@@ -295,15 +328,20 @@ def conservation_plot(positions: pd.DataFrame, dark: bool = False) -> go.Figure:
     if d.empty:
         return _style(fig, dark, "al2co scores unavailable (identical sequences?)", 200)
     smooth = d["al2co_score"].rolling(9, center=True, min_periods=1).mean()
-    fig.add_trace(go.Scatter(
-        x=d["Position"], y=d["al2co_score"], mode="markers", name="al2co score",
-        marker=dict(color=d["al2co_score"], colorscale=_scale(seq_ramp(SEQ_BLUE, dark)), size=7,
-                    line=dict(color=t["surface"], width=1),
-                    colorbar=dict(title=dict(text="al2co", side="right"), thickness=10, outlinewidth=0)),
-        customdata=np.stack([d["Residue"], d["Conservation"].fillna(np.nan), d["Gap fraction"].fillna(np.nan)], axis=1),
-        hovertemplate="%{customdata[0]}%{x}<br>al2co %{y:.2f}<br>modal residue %{customdata[1]:.0%}"
-                      " · gaps %{customdata[2]:.0%}<extra></extra>",
-    ))
+    variable = d["Variants"] > 0 if "Variants" in d else pd.Series(False, index=d.index)
+    for flag, name, color, size in ((False, "no variant", t["series"][0], 6),
+                                    (True, "position with variants", t["series"][1], 8)):
+        m = variable == flag
+        if not m.any():
+            continue
+        dd = d[m]
+        fig.add_trace(go.Scatter(
+            x=dd["Position"], y=dd["al2co_score"], mode="markers", name=f"{name} ({int(m.sum())})",
+            marker=dict(color=color, size=size, line=dict(color=t["surface"], width=1)),
+            customdata=np.stack([dd["Residue"], dd["Conservation"], dd["Gap fraction"]], axis=1),
+            hovertemplate="%{customdata[0]}%{x}<br>al2co %{y:.2f}<br>modal residue %{customdata[1]:.0%}"
+                          " · gaps %{customdata[2]:.0%}<extra></extra>",
+        ))
     fig.add_trace(go.Scatter(x=d["Position"], y=smooth, mode="lines", name="9-residue mean",
                              line=dict(color=t["ink2"], width=2), hoverinfo="skip"))
     fig.update_xaxes(title="Reference position")
@@ -320,6 +358,7 @@ def sequence_logo(bits: pd.DataFrame, start: int, end: int, dark: bool = False) 
         return _style(fig, dark, "No positions in range", 200)
     vals = w.to_numpy()
     aas = np.array(w.columns)
+    chem = chemistry_colors(dark)
     order = np.argsort(vals, axis=1)  # ascending -> trace k holds the k-th smallest
     for k in range(vals.shape[1]):
         idx = order[:, k]
@@ -328,13 +367,13 @@ def sequence_logo(bits: pd.DataFrame, start: int, end: int, dark: bool = False) 
         if (h <= 1e-3).all():
             continue
         fig.add_trace(go.Bar(
-            x=w.index, y=h, marker=dict(color=[CHEMISTRY_COLORS.get(a, "#ADB5BD") for a in letters], line_width=0),
+            x=w.index, y=h, marker=dict(color=[chem.get(a, "#ADB5BD") for a in letters], line_width=0),
             text=[a if v > 0.12 else "" for a, v in zip(letters, h)], textposition="inside",
             insidetextanchor="middle", textfont=dict(color="#ffffff", family=FONT, size=11),
             customdata=letters, hovertemplate="Position %{x}<br>%{customdata}: %{y:.2f} bits<extra></extra>",
             showlegend=False,
         ))
-    for name, color in CHEMISTRY_LEGEND:
+    for name, color in chemistry_legend(dark):
         fig.add_trace(go.Bar(x=[None], y=[None], name=name, marker_color=color))
     fig.update_layout(barmode="stack", bargap=0.08)
     fig.update_xaxes(title="Reference position", dtick=5 if end - start <= 80 else None)
@@ -369,7 +408,8 @@ def msa_view(msa, mapping: List[Optional[int]], start: int, end: int, row_ids: O
     rows = ([ref] if ref else []) + others[:max_rows]
     letters = np.array([list(str(r.seq)[c0:c1].upper()) for r in rows])
     z = np.vectorize(lambda a: _AA_INDEX.get(a, 0))(letters)
-    palette = [GAP_COLOR[dark]] + [CHEMISTRY_COLORS.get(a, "#ADB5BD") for a in "ACDEFGHIKLMNPQRSTVWYX"]
+    chem = chemistry_colors(dark)
+    palette = [GAP_COLOR[dark]] + [chem.get(a, "#ADB5BD") for a in "ACDEFGHIKLMNPQRSTVWYX"]
     same = np.zeros(letters.shape, dtype=bool)
     if differences_only and ref is not None:
         palette[0] = tokens(dark)["muted"]  # gaps must stand out against matching residues
@@ -388,7 +428,7 @@ def msa_view(msa, mapping: List[Optional[int]], start: int, end: int, row_ids: O
         z=z, x=list(range(c0, c1)), y=list(range(len(rows))), colorscale=scale, zmin=0, zmax=n, showscale=False,
         text=np.where(same, "·", letters),
         texttemplate="%{text}" if (c1 - c0) <= 120 and len(rows) <= 60 else None,
-        textfont=dict(color="#ffffff" if not differences_only else tokens(dark)["ink2"], size=10,
+        textfont=dict(color="#ffffff" if (dark or not differences_only) else tokens(dark)["ink2"], size=10,
                       family="ui-monospace, monospace"),
         customdata=np.array([[f"{nm}|{xlab[j]}" for j in range(c1 - c0)] for nm in names]),
         hovertemplate="%{customdata}<br>%{text}<extra></extra>", xgap=0, ygap=1,
@@ -429,7 +469,7 @@ def tree_figure(newick_path: str, highlight: Optional[Iterable[str]] = None, hig
         for ch in clade.clades:
             ex += [x0, x0, depths[ch], None]
             ey += [ypos[clade], ypos[ch], ypos[ch], None]
-    fig = go.Figure(go.Scatter(x=ex, y=ey, mode="lines", line=dict(color=t["muted"], width=1),
+    fig = go.Figure(go.Scatter(x=ex, y=ey, mode="lines", line=dict(color=t["ink2"] if dark else t["muted"], width=1),
                                hoverinfo="skip", showlegend=False))
     hl = set(highlight or [])
     names = [leaf.name or "" for leaf in leaves]
@@ -489,7 +529,7 @@ def structure_html(
 
     t = tokens(dark)
     ramp = (seq_ramp(SEQ_BLUE, dark) if color_mode == "conservation"
-            else [GAP_COLOR[dark]] + seq_ramp(SEQ_ORANGE[2:], dark))
+            else [NEUTRAL_3D[dark]] + frequency_ramp(dark)[1:])
     view = py3Dmol.view(width=width, height=height)
     view.setBackgroundColor(t["surface"])
     for i, ch in enumerate(chains):

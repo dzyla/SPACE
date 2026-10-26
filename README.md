@@ -40,13 +40,16 @@ streamlit run app.py
 1. Pick NCBI or UniProt and enter a query, e.g.
    `"Henipavirus hendraense"[Organism] AND fusion[Title]` (NCBI) or
    `gene:TP53 AND organism_id:9606` (UniProt). Fielded queries keep unrelated
-   proteins out.
+   proteins out. **Preview hits** opens the exact search (filters included) on
+   NCBI / UniProt so you can check what a query returns before fetching.
 2. Choose the reference (a curated Swiss-Prot/RefSeq entry or the most common
    full-length sequence is pre-selected) and filter by identity, length and
    coverage.
 3. Explore the variant report: lollipop landscape, variant table (select rows to
    highlight them in the structure, alignment and tree), conservation, 3D
    structure, alignment and tree, per-sequence calls, exports.
+   GenBank sample metadata (host, country, collection date) downloads in the
+   background with a progress bar and is saved with the run.
 
 ## Command line
 

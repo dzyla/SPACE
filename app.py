@@ -6,6 +6,7 @@ import io
 import logging
 import shutil
 import socket
+import threading
 import time
 import uuid
 import zipfile
@@ -23,7 +24,7 @@ from space.core.align import filter_hits, pairwise_to_reference
 from space.core.conservation import logo_and_consensus
 from space.core.pipeline import SpaceRun, analyse, choose_reference, list_runs, new_run_dir
 from space.core.sequences import (extract_uniprot_accession, fetch_sequences, parse_sequence_text,
-                                  read_fasta)
+                                  read_fasta, search_url)
 from space.core.structure import (download_alphafold, download_pdb, map_to_structure, pdb_metadata,
                                   search_pdb)
 
@@ -130,33 +131,8 @@ def sidebar() -> None:
     sb = st.sidebar
     sb.markdown("### 🧬 SPACE")
     sb.caption("Find and interpret protein variants across sequence databases.")
-    st.session_state.setdefault("source_input", "NCBI")
-    with sb.form("fetch_form"):
-        source = st.segmented_control("Database", ["NCBI", "UniProt"], key="source_input", required=True)
-        query = st.text_area(
-            "Search query", key="query_input", height=90,
-            placeholder='"Henipavirus hendraense"[Organism] AND fusion[Title]',
-            help="NCBI: Entrez syntax, e.g. `\"Influenza A virus\"[Organism] AND hemagglutinin[Title]`.\n\n"
-                 "UniProt: query syntax, e.g. `gene:TP53 AND organism_id:9606`.\n\n"
-                 "Fielded queries avoid unrelated proteins slipping in.",
-        )
-        email = st.text_input("Email (required by NCBI)", key="email_input", placeholder="you@example.org",
-                              autocomplete="email")
-        max_seqs = st.number_input("Maximum sequences (-1 = all, capped at 20,000)", min_value=-1,
-                                   value=500, step=100)
-        with st.expander("Options"):
-            refseq_only = st.checkbox("NCBI: RefSeq only")
-            remove_pdb = st.checkbox("Remove PDB-derived sequences", value=True)
-            reviewed_only = st.checkbox("UniProt: reviewed (Swiss-Prot) only")
-        submitted = st.form_submit_button("Fetch sequences", type="primary", width="stretch")
-
-    if submitted:
-        if not query.strip():
-            sb.error("Enter a search query.")
-        elif source == "NCBI" and "@" not in (email or ""):
-            sb.error("NCBI requires a valid email address.")
-        else:
-            fetch(source, query.strip(), email, int(max_seqs), refseq_only, reviewed_only, remove_pdb)
+    with sb:
+        fetch_panel()
 
     with sb.expander("…or upload a FASTA file"):
         up = st.file_uploader("FASTA", type=["fasta", "fa", "faa", "fas", "txt"], label_visibility="collapsed")
@@ -183,6 +159,40 @@ def sidebar() -> None:
                "Based on Zyla, D. *et al.* Science (2024) · [GitHub](https://github.com/dzyla/SPACE)")
 
 
+@st.fragment
+def fetch_panel() -> None:
+    """Search form. A fragment (not st.form) so the preview link follows the query as it is typed
+    without rerunning the whole app."""
+    st.session_state.setdefault("source_input", "NCBI")
+    source = st.segmented_control("Database", ["NCBI", "UniProt"], key="source_input", required=True)
+    query = st.text_area(
+        "Search query", key="query_input", height=90,
+        placeholder='"Henipavirus hendraense"[Organism] AND fusion[Title]',
+        help="NCBI: Entrez syntax, e.g. `\"Influenza A virus\"[Organism] AND hemagglutinin[Title]`.\n\n"
+             "UniProt: query syntax, e.g. `gene:TP53 AND organism_id:9606`.\n\n"
+             "Fielded queries avoid unrelated proteins slipping in.",
+    )
+    email = st.text_input("Email (required by NCBI)", key="email_input", placeholder="you@example.org",
+                          autocomplete="email")
+    max_seqs = st.number_input("Maximum sequences (-1 = all, capped at 20,000)", min_value=-1,
+                               value=500, step=100)
+    with st.expander("Options"):
+        refseq_only = st.checkbox("NCBI: RefSeq only")
+        remove_pdb = st.checkbox("Remove PDB-derived sequences", value=True)
+        reviewed_only = st.checkbox("UniProt: reviewed (Swiss-Prot) only")
+    site = "NCBI Protein" if source == "NCBI" else "UniProt"
+    st.link_button(f"Preview hits on {site} ↗", search_url((query or "").strip(), source, refseq_only, reviewed_only),
+                   width="stretch", help="Open this exact search (filters included) in the database's own "
+                                         "web interface to check the hits before fetching.")
+    if st.button("Fetch sequences", type="primary", width="stretch"):
+        if not (query or "").strip():
+            st.error("Enter a search query.")
+        elif source == "NCBI" and "@" not in (email or ""):
+            st.error("NCBI requires a valid email address.")
+        else:
+            fetch(source, query.strip(), email, int(max_seqs), refseq_only, reviewed_only, remove_pdb)
+
+
 def fetch(source, query, email, max_seqs, refseq_only, reviewed_only, remove_pdb) -> None:
     sdir = session_dir() / "fetch" / uuid.uuid4().hex[:8]
     with st.status(f"Fetching from {source}…", expanded=True) as status, surfaced_warnings():
@@ -202,6 +212,7 @@ def fetch(source, query, email, max_seqs, refseq_only, reviewed_only, remove_pdb
     st.session_state.update(records=records, fasta_path=path, fetch_params={
         "query": query, "source": source, "email": email, "max_seqs": max_seqs,
         "refseq_only": refseq_only, "reviewed_only": reviewed_only, "remove_pdb": remove_pdb})
+    st.rerun()  # called from the sidebar fragment: rerun the whole app to show the setup stage
 
 
 def load_uploaded_fasta(upload) -> None:
@@ -433,8 +444,8 @@ def variants_tab(run: SpaceRun, dark: bool) -> List[str]:
     feats = ann["features"] if ann else None
     chart(viz.variant_landscape(view, positions[positions["Position"].between(*span)], features=feats,
                                 unique=unique, log_y=log_y, highlight=selected, dark=dark), key="landscape")
-    st.caption("Stems show the most frequent variant at each position; the strip below is al2co "
-               "conservation (dark = conserved). Select table rows to highlight variants everywhere.")
+    st.caption("Stems show the most frequent variant at each position; the strip below is "
+               "variability from al2co (strong colour = variable, faint = conserved). Select table rows to highlight variants everywhere.")
 
     cols = ["Mutation", "HGVS", "Type", "Position", "Count", "Covering", "Frequency", "Unique carriers",
             "Unique frequency", "BLOSUM62", "Change"]
@@ -480,17 +491,23 @@ def variants_tab(run: SpaceRun, dark: bool) -> List[str]:
                        f"single-residue variants; {known} of your variants are already reported.")
     with right.container(border=True):
         st.markdown("**Sample metadata (GenBank)**")
-        meta = st.session_state.get("metadata")
+        meta = run_metadata(run)
         email = (st.session_state.get("fetch_params") or {}).get("email") or run.params.get("email")
+        job = st.session_state.get("metadata_job")
         if run.params.get("source") != "NCBI":
             st.caption("Host, country and collection date are available for NCBI runs.")
-        elif st.button("Fetch host / country / collection date", disabled=not email):
-            with st.spinner("Downloading GenBank records…"), surfaced_warnings():
-                st.session_state.metadata = annotate.ncbi_source_metadata(list(run.selected["id"]), email)
-                st.rerun()
+        elif job is not None and job["run_id"] == run.run_id:
+            metadata_progress()
+        elif st.button("Fetch host / country / collection date" if meta is None else "Fetch again",
+                       disabled=not email):
+            start_metadata_job(run, email)
+            st.rerun()
+        if err := st.session_state.pop("metadata_error", None):
+            st.error(f"Metadata download failed: {err}")
         if meta is not None and not meta.empty:
-            st.caption(f"Metadata for {len(meta)} sequences · years "
-                       f"{meta['Year'].min()}–{meta['Year'].max()}")
+            years = meta["Year"].dropna()
+            st.caption(f"Metadata for {len(meta)} sequences"
+                       + (f" · years {years.min()}–{years.max()}" if not years.empty else ""))
 
     if meta is not None and not meta.empty and meta["Year"].notna().any():
         tracked = selected[:8] or list(view["Mutation"].head(4))
@@ -502,6 +519,56 @@ def variants_tab(run: SpaceRun, dark: bool) -> List[str]:
     with st.expander("Substitution heatmap"):
         chart(viz.substitution_heatmap(view, unique=unique, dark=dark), key="subheat")
     return selected
+
+
+def run_metadata(run: SpaceRun) -> Optional[pd.DataFrame]:
+    """GenBank metadata for this run: from the session, else from the run folder."""
+    if st.session_state.get("metadata") is None:
+        st.session_state.metadata = annotate.load_metadata(run.run_dir)
+    return st.session_state.metadata
+
+
+def start_metadata_job(run: SpaceRun, email: str) -> None:
+    """Fetch GenBank metadata in a background thread so the page stays usable;
+    ``metadata_progress`` polls it. Threads cannot call Streamlit, so the job
+    only writes into a plain dict."""
+    ids = list(run.selected["id"])
+    job = {"run_id": run.run_id, "total": len(ids), "fraction": 0.0, "message": "Starting…",
+           "stop": False, "result": None, "error": None, "finished": False, "started": time.time()}
+
+    def work() -> None:
+        try:
+            meta = annotate.ncbi_source_metadata(
+                ids, email, progress=lambda f, m: job.update(fraction=f, message=m),
+                should_stop=lambda: job["stop"])
+            annotate.save_metadata(run.run_dir, meta)
+            job["result"] = meta
+        except Exception as exc:  # noqa: BLE001
+            job["error"] = str(exc)
+        finally:
+            job["finished"] = True
+
+    threading.Thread(target=work, name=f"metadata-{run.run_id}", daemon=True).start()
+    st.session_state.metadata_job = job
+
+
+@st.fragment(run_every=1.0)
+def metadata_progress() -> None:
+    job = st.session_state.get("metadata_job")
+    if job is None:
+        return
+    if job["finished"]:
+        st.session_state.pop("metadata_job", None)
+        if job["error"]:
+            st.session_state.metadata_error = job["error"]
+        elif job["result"] is not None:
+            st.session_state.metadata = job["result"]
+        st.rerun()  # whole app: timeline, carrier tables and sequence table pick up the metadata
+    elapsed = time.time() - job["started"]
+    st.progress(job["fraction"], text=f"{job['message']} · {elapsed:.0f}s")
+    st.caption("Runs in the background — keep exploring; results appear when it finishes.")
+    if st.button("Stop", key="metadata_stop", disabled=job["stop"]):
+        job["stop"] = True
 
 
 def variant_detail(run: SpaceRun, summary: pd.DataFrame, selected: List[str], dark: bool) -> None:
@@ -520,7 +587,7 @@ def variant_detail(run: SpaceRun, summary: pd.DataFrame, selected: List[str], da
         st.caption(f"{row['Type']} · {row['Change']}" + (f" · BLOSUM62 {row['BLOSUM62']:.0f}"
                                                         if pd.notna(row["BLOSUM62"]) else ""))
         table = pd.DataFrame({"Sequence ID": carriers})
-        meta = st.session_state.get("metadata")
+        meta = run_metadata(run)
         if meta is not None and not meta.empty:
             table = table.merge(meta, on="Sequence ID", how="left")
         hits = run.hits.drop_duplicates("id").set_index("id")
@@ -704,7 +771,7 @@ def sequences_tab(run: SpaceRun) -> None:
     ps = run.variants.per_sequence.copy()
     hits = run.hits.drop_duplicates("id").set_index("id")
     ps["Identity (%)"] = ps["Sequence ID"].map(hits["identity"])
-    meta = st.session_state.get("metadata")
+    meta = run_metadata(run)
     if meta is not None and not meta.empty:
         ps = ps.merge(meta, on="Sequence ID", how="left")
     st.markdown(f"**{(ps['Status'] == 'included').sum()} analysed**, "
@@ -731,7 +798,8 @@ def _zip_run(run_dir: str, stamp: float) -> bytes:
 def export_tab(run: SpaceRun) -> None:
     # The run is saved when created/opened; re-saving on every rerun would
     # bust the ZIP cache below.
-    stamp = (run.run_dir / "run.json").stat().st_mtime
+    stamp = max(f.stat().st_mtime for f in (run.run_dir / "run.json", run.run_dir / "tables" / "metadata.tsv")
+                if f.exists())
     st.download_button("Download all results (ZIP)", _zip_run(str(run.run_dir), stamp),
                        file_name=f"{run.run_id}.zip", mime="application/zip", type="primary")
     s = annotated_summary(run)
